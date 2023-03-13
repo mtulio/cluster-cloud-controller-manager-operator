@@ -37,7 +37,8 @@ func IsCloudProviderExternal(platformStatus *configv1.PlatformStatus, featureGat
 		configv1.NutanixPlatformType,
 		configv1.OpenStackPlatformType,
 		configv1.PowerVSPlatformType,
-		configv1.VSpherePlatformType:
+		configv1.VSpherePlatformType,
+		configv1.ExternalPlatformType:
 		return true, nil
 	default:
 		// Platforms that do not have external cloud providers implemented

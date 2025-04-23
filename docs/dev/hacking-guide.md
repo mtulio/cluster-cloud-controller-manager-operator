@@ -118,17 +118,10 @@ You can pick one of available CI releases from the list here: https://amd64.ocp.
 CI builds are pruned regularly and as such, you will have to create a new release every few days with an updated base release. Follow the process above and run `oc adm release new` once again.
 
 Tags for image overrides are coming from the operator manifests itself. The image tags could be found in `manifests/image-references`. Example: https://github.com/openshift/cluster-cloud-controller-manager-operator/blob/master/manifests/image-references
-```
 
 ## How to deploy a cluster with a custom release image and enabled CCM configuration from the start
 
 To deploy a cluster with all changes built in the previous step, all you need to do is to specify the `OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE` env variable to the installer binary.
-
-```bash
-OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE=quay.io/<your-repo>/release:<your-branch> openshift-install create cluster
-```
-
-However, in order for the cluster to run the CCM from the start, you need to add an additional step to the installation.
 
 ```bash
 export OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE=quay.io/<your-repo>/release:<your-branch> 

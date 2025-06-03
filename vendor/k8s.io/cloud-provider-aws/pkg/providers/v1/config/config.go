@@ -17,6 +17,12 @@ const (
 
 	// ClusterServiceLoadBalancerHealthProbeModeServiceNodePort is the service node port health probe mode for cluster service load balancer.
 	ClusterServiceLoadBalancerHealthProbeModeServiceNodePort = "ServiceNodePort"
+
+	// NLBSecurityGroupModeManaged indicates the controller is managing security groups on service type loadbalancer NLB.
+	NLBSecurityGroupModeManaged = "Managed"
+
+	// NLBSecurityGroupModeUnmanaged indicates the controller is not managing security groups on service type loadbalancer NLB.
+	NLBSecurityGroupModeUnmanaged = "Unmanaged"
 )
 
 // CloudConfig wraps the settings for the AWS cloud provider.
@@ -84,9 +90,9 @@ type CloudConfig struct {
 		// ClusterServiceSharedLoadBalancerHealthProbePath defines the target path of the shared health probe. Default to `/healthz`.
 		ClusterServiceSharedLoadBalancerHealthProbePath string `json:"clusterServiceSharedLoadBalancerHealthProbePath,omitempty" yaml:"clusterServiceSharedLoadBalancerHealthProbePath,omitempty"`
 
-		// NLBSecurityGroupEnabled determines if the service type loadbalancer NLB creates and manages
-		// the resource with a security group (similar default behavior Classic Load Balancer).
-		NLBSecurityGroupEnabled bool `json:"nlbSecurityGroupEnabled,omitempty" yaml:"nlbSecurityGroupEnabled,omitempty"`
+		// NLBSecurityGroupMode determines if the controller manage, creates and attaches, the security group when the service type
+		// loadbalancer NLB is created.
+		NLBSecurityGroupMode string `json:"nlbSecurityGroupMode,omitempty" yaml:"nlbSecurityGroupMode,omitempty"`
 	}
 	// [ServiceOverride "1"]
 	//  Service = s3

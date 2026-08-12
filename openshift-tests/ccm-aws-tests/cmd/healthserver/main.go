@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -75,19 +74,26 @@ func main() {
 		s.mu.Unlock()
 	}()
 
+	// On SIGTERM (sent by kubelet during pod deletion), transition to
+	// "draining" state: /readyz returns 503 but the server keeps serving
+	// on / with X-Server-State: draining. The pod continues to serve
+	// for terminationGracePeriodSeconds (set by the Deployment) before
+	// kubelet force-kills it. This matches KAS behavior during rollouts:
+	// SIGTERM → readyz→503 → keep serving for shutdown-delay-duration.
 	go func() {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
 		sig := <-ch
-		log.Printf("received %s, shutting down", sig)
+		log.Printf("received %s, setting readyz→503 (draining), server continues serving", sig)
 		s.mu.Lock()
 		now := time.Now()
 		s.shutdownInitiated = &now
-		s.state = stateShutdown
+		s.readyzFalseAt = &now
+		s.state = stateDraining
 		s.mu.Unlock()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		srv.Shutdown(ctx)
+		// Do NOT call srv.Shutdown() — keep serving until kubelet kills us
+		// at the end of terminationGracePeriodSeconds. This simulates KAS
+		// keeping its TCP port open during shutdown-delay-duration.
 	}()
 
 	s.mu.Lock()

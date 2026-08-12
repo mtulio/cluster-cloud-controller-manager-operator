@@ -47,6 +47,9 @@ func NewClient(targetURL string, interval time.Duration, numWorkers int) *Client
 		workers:   numWorkers,
 		httpClient: &http.Client{
 			Transport: &http.Transport{
+				// DisableKeepAlives forces a new TCP connection per request,
+				// matching NLB per-connection routing behavior. This is
+				// essential for detecting which target receives each request.
 				DisableKeepAlives: true,
 				TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
 			},

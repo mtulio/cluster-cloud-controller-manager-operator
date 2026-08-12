@@ -35,14 +35,20 @@ const (
 	kasShutdownDelay = 192 * time.Second
 
 	// defaultClientInterval controls how often each worker sends requests
-	// through the NLB. Lower values increase load density for propagation testing.
-	defaultClientInterval = 200 * time.Millisecond
-
-	// defaultClientWorkers is the number of parallel request goroutines.
-	// Multiple workers prevent high-latency links (e.g., client in South America
-	// → NLB in us-east-1) from bottlenecking throughput. Each worker fires
-	// independently on its own ticker.
-	defaultClientWorkers = 4
+	// through the NLB. Each worker fires independently on its own ticker.
+	// With DisableKeepAlives (new TCP per request), each worker creates
+	// one outbound connection at a time. Too many workers with short
+	// intervals can exhaust ephemeral ports and starve K8s API calls.
+	// 8 workers at 100ms: best throughput/error ratio from testing.
+	// Tested configurations (South America → us-east-1, ~430ms RTT):
+	//   4×200ms  =  9.3 req/s,  0.5% errors (baseline)
+	//   8×100ms  = 12.8 req/s,  2.1% errors (sweet spot)
+	//   16×50ms  = 13.6 req/s,  5.3% errors (diminishing returns)
+	//   40×50ms  = port exhaustion / API timeout (broken)
+	// RTT is the bottleneck, not worker count. More workers from same
+	// machine just create more connections on the same network path.
+	defaultClientInterval = 100 * time.Millisecond
+	defaultClientWorkers  = 8
 
 	// postHealthyObserve is how long we continue observing after all targets
 	// become healthy (both initial setup and post-restart). 90s gives enough
@@ -85,6 +91,10 @@ type transitionTimeline struct {
 	TargetPod  string
 	TargetNode string
 	NewPod     string
+
+	// PodNodeMap maps pod names to the node they run on, used for
+	// displaying node identity alongside pod names in the report.
+	PodNodeMap map[string]string
 }
 
 // serviceConfig records Service, TG, and environment configuration for the report.
@@ -159,17 +169,19 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			framework.Logf("[steady] %d requests, %d non-ready", len(steadyRecords), steadyNonReady)
 			Expect(steadyNonReady).To(Equal(0), "pre-readyz responses during steady state")
 
+			By("listing pods to identify target for rollout simulation")
 			pods, err := cs.CoreV1().Pods(ns.Name).List(ctx, metav1.ListOptions{
 				LabelSelector: fmt.Sprintf("app=%s", deployName),
 			})
-			framework.ExpectNoError(err)
+			framework.ExpectNoError(err, "list healthserver pods")
 			Expect(len(pods.Items)).To(BeNumerically(">=", int(replicas)))
 
-			// Build knownServers from ALL existing pods (not client records,
-			// which may miss pods due to NLB routing distribution).
+			// Build knownServers and podNodeMap from ALL existing pods.
 			knownServers := make(map[string]bool)
+			podNodeMap := make(map[string]string)
 			for _, p := range pods.Items {
 				knownServers[p.Name] = true
+				podNodeMap[p.Name] = p.Spec.NodeName
 			}
 
 			targetPod := pods.Items[0].Name
@@ -195,6 +207,12 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			By("waiting for replacement pod")
 			newPod := waitForNewPod(ctx, cs, ns.Name, deployName, targetPod)
 
+			// Capture the new pod's node for the report
+			newPodObj, npErr := cs.CoreV1().Pods(ns.Name).Get(ctx, newPod, metav1.GetOptions{})
+			if npErr == nil {
+				podNodeMap[newPod] = newPodObj.Spec.NodeName
+			}
+
 			// Wait for the restarted target to become healthy again, then observe
 			// for postHealthyObserve to confirm stable routing.
 			By("waiting for restarted target to become healthy")
@@ -208,12 +226,10 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			allEvents := observer.Events()
 
 			tl := computeTimeline(targetPod, knownServers, t5, t71, allRecords, allEvents)
-			// Copy setup-phase timers (t0-t3) into the timeline
 			tl.T0 = setupTimes.T0
 			tl.T1 = setupTimes.T1
 			tl.T2 = setupTimes.T2
 			tl.T3 = setupTimes.T3
-			// t4: first successful client request (NLB routing established)
 			for _, r := range steadyRecords {
 				if r.Error == "" && r.HTTPStatus > 0 {
 					tl.T4 = r.Timestamp
@@ -223,6 +239,7 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			tl.TargetPod = targetPod
 			tl.TargetNode = targetNode
 			tl.NewPod = newPod
+			tl.PodNodeMap = podNodeMap
 
 			report := buildReport("5.5 (Pre-Readyz Routing / OCPBUGS-86789)",
 				tl, svcCfg, replicas, startupDelay, shutdownDelay,
@@ -296,15 +313,19 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			}
 			Expect(steadyNonReady).To(Equal(0), "pre-readyz responses during steady state")
 
+			By("listing pods to identify target for rollout simulation")
 			pods, err := cs.CoreV1().Pods(ns.Name).List(ctx, metav1.ListOptions{
 				LabelSelector: fmt.Sprintf("app=%s", deployName),
 			})
-			framework.ExpectNoError(err)
+			framework.ExpectNoError(err, "list healthserver pods (K8s API may be overloaded by client workers)")
 			Expect(len(pods.Items)).To(BeNumerically(">=", int(replicas)))
 
+			// Build knownServers and podNodeMap from ALL existing pods.
 			knownServers := make(map[string]bool)
+			podNodeMap := make(map[string]string)
 			for _, p := range pods.Items {
 				knownServers[p.Name] = true
+				podNodeMap[p.Name] = p.Spec.NodeName
 			}
 
 			targetPod := pods.Items[0].Name
@@ -325,6 +346,12 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 
 			By("waiting for replacement pod")
 			newPod := waitForNewPod(ctx, cs, ns.Name, deployName, targetPod)
+
+			// Capture the new pod's node for the report
+			newPodObj, npErr := cs.CoreV1().Pods(ns.Name).Get(ctx, newPod, metav1.GetOptions{})
+			if npErr == nil {
+				podNodeMap[newPod] = newPodObj.Spec.NodeName
+			}
 
 			By("waiting for restarted target to become healthy")
 			err = waitForAllTGTargetsHealthy(ctx, observer, 10*time.Minute)
@@ -350,6 +377,7 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			tl.TargetPod = targetPod
 			tl.TargetNode = targetNode
 			tl.NewPod = newPod
+			tl.PodNodeMap = podNodeMap
 
 			report := buildReport("5.5-CAPA (Pre-Readyz + conn_term=false draining=300s)",
 				tl, svcCfg, replicas, startupDelay, shutdownDelay,
@@ -394,10 +422,15 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			By(fmt.Sprintf("verifying steady state for %s", postHealthyObserve))
 			time.Sleep(postHealthyObserve)
 
+			By("listing pods to identify target for shutdown simulation")
 			pods, err := cs.CoreV1().Pods(ns.Name).List(ctx, metav1.ListOptions{
 				LabelSelector: fmt.Sprintf("app=%s", deployName),
 			})
-			framework.ExpectNoError(err)
+			framework.ExpectNoError(err, "list healthserver pods")
+			podNodeMap := make(map[string]string)
+			for _, p := range pods.Items {
+				podNodeMap[p.Name] = p.Spec.NodeName
+			}
 			targetPod := pods.Items[0].Name
 			targetNode := pods.Items[0].Spec.NodeName
 
@@ -434,6 +467,7 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			}
 			tl.TargetPod = targetPod
 			tl.TargetNode = targetNode
+			tl.PodNodeMap = podNodeMap
 
 			report := buildReport("5.2 (Shutdown Propagation / SPLAT-307)",
 				tl, svcCfg, replicas, startupDelay, 0,
@@ -971,6 +1005,16 @@ func buildReport(
 		}
 	}
 
+	// Compute average req/s across the full test duration (t3→last record)
+	var avgReqsPerSec float64
+	var testDuration time.Duration
+	if len(records) > 1 {
+		testDuration = records[len(records)-1].Timestamp.Sub(records[0].Timestamp)
+		if testDuration > 0 {
+			avgReqsPerSec = float64(totalReqs) / testDuration.Seconds()
+		}
+	}
+
 	w("")
 	w("REQUEST STATISTICS")
 	w("  Total:    %d", totalReqs)
@@ -978,6 +1022,8 @@ func buildReport(
 	w("  4xx:      %d", reqs4xx)
 	w("  5xx:      %d", reqs5xx)
 	w("  Errors:   %d (connection/timeout failures)", reqsErr)
+	w("  Duration: %s", testDuration.Truncate(time.Second))
+	w("  Avg rate: %.1f req/s", avgReqsPerSec)
 
 	// ── Per-phase request breakdown ──
 	// Phases are defined by the timeline milestones:
@@ -1028,17 +1074,23 @@ func buildReport(
 
 	w("")
 	w("REQUEST BREAKDOWN BY PHASE")
-	w("%-25s %10s %8s %8s %8s %8s", "Phase", "Duration", "Total", "2xx", "Errors", "PreRdz")
-	w("%-25s %10s %8s %8s %8s %8s", strings.Repeat("─", 25), strings.Repeat("─", 10), strings.Repeat("─", 8), strings.Repeat("─", 8), strings.Repeat("─", 8), strings.Repeat("─", 8))
+	w("%-25s %10s %8s %8s %8s %8s %10s", "Phase", "Duration", "Total", "2xx", "Errors", "PreRdz", "Avg req/s")
+	w("%-25s %10s %8s %8s %8s %8s %10s", strings.Repeat("─", 25), strings.Repeat("─", 10), strings.Repeat("─", 8), strings.Repeat("─", 8), strings.Repeat("─", 8), strings.Repeat("─", 8), strings.Repeat("─", 10))
 	for _, ps := range phases {
 		dur := "N/A"
+		rps := "N/A"
+		var phaseDur time.Duration
 		if !ps.from.IsZero() && !ps.to.IsZero() {
-			dur = ps.to.Sub(ps.from).Truncate(time.Second).String()
+			phaseDur = ps.to.Sub(ps.from)
 		} else if !ps.from.IsZero() && len(records) > 0 {
 			// Open-ended phase (→end): use last record timestamp
-			dur = records[len(records)-1].Timestamp.Sub(ps.from).Truncate(time.Second).String()
+			phaseDur = records[len(records)-1].Timestamp.Sub(ps.from)
 		}
-		w("%-25s %10s %8d %8d %8d %8d", ps.name, dur, ps.total, ps.ok, ps.err, ps.preRdz)
+		if phaseDur > 0 {
+			dur = phaseDur.Truncate(time.Second).String()
+			rps = fmt.Sprintf("%.1f", float64(ps.total)/phaseDur.Seconds())
+		}
+		w("%-25s %10s %8d %8d %8d %8d %10s", ps.name, dur, ps.total, ps.ok, ps.err, ps.preRdz, rps)
 	}
 
 	// ── Per-server request distribution by phase ──
@@ -1086,16 +1138,24 @@ func buildReport(
 		w("")
 		w("PER-SERVER REQUEST DISTRIBUTION BY PHASE")
 
-		// Annotate server IDs with their role in the test
+		// Annotate server IDs with their role and node name.
+		// Format: "pod-name (node-name) ← TARGET"
 		serverLabel := func(id string) string {
+			node := ""
+			if tl.PodNodeMap != nil {
+				node = tl.PodNodeMap[id]
+			}
+			role := ""
 			switch id {
 			case tl.TargetPod:
-				return id + " ← TARGET"
+				role = " ← TARGET"
 			case tl.NewPod:
-				return id + " ← NEW"
-			default:
-				return id
+				role = " ← NEW"
 			}
+			if node != "" {
+				return fmt.Sprintf("%s (%s)%s", id, node, role)
+			}
+			return id + role
 		}
 
 		// Print a sub-table per phase showing each server's request count

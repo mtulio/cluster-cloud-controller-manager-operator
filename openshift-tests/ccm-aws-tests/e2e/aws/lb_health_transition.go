@@ -2,6 +2,7 @@ package aws
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -26,6 +27,8 @@ import (
 )
 
 const (
+	// envHealthserverImage is the container image for the unified binary
+	// e2e-nlb-health-test. Used for all three roles (serve, client, aggregator).
 	envHealthserverImage = "HEALTHSERVER_IMAGE"
 
 	healthTransitionTestPrefix = e2eTestPrefixLoadBalancer + " health-transition"
@@ -34,6 +37,12 @@ const (
 	// via hostNetwork. Chosen to avoid conflicts with existing services on
 	// control-plane nodes (verified via netstat). Echoes 6443 (KAS port).
 	healthserverPort = 19443
+
+	// aggregatorPort is the port the aggregator listens on (worker node).
+	aggregatorPort = 8090
+
+	// clientPort is the port the in-cluster client serves metrics/records on.
+	clientPort = 8080
 
 	// kasShutdownDelay matches the KAS shutdown-delay-duration (135s graceful +
 	// margin), simulating how long KAS keeps serving after /readyz→503 before
@@ -45,16 +54,13 @@ const (
 	// With DisableKeepAlives (new TCP per request), each worker creates
 	// one outbound connection at a time. Too many workers with short
 	// intervals can exhaust ephemeral ports and starve K8s API calls.
-	// 8 workers at 100ms: best throughput/error ratio from testing.
-	// Tested configurations (South America → us-east-1, ~430ms RTT):
-	//   4×200ms  =  9.3 req/s,  0.5% errors (baseline)
-	//   8×100ms  = 12.8 req/s,  2.1% errors (sweet spot)
-	//   16×50ms  = 13.6 req/s,  5.3% errors (diminishing returns)
-	//   40×50ms  = port exhaustion / API timeout (broken)
-	// RTT is the bottleneck, not worker count. More workers from same
-	// machine just create more connections on the same network path.
-	defaultClientInterval = 100 * time.Millisecond
-	defaultClientWorkers  = 8
+	// With the in-cluster client (~1-5ms RTT to NLB), higher concurrency
+	// is safe. 16 workers at 50ms = ~320 req/s at 1ms RTT, ~160 req/s
+	// at 5ms RTT. Port exhaustion is not a concern because the client
+	// runs inside the cluster on a worker node, not from an external
+	// machine competing with K8s API calls.
+	defaultClientInterval = 50 * time.Millisecond
+	defaultClientWorkers  = 16
 
 	// postHealthyObserve is how long we continue observing after all targets
 	// become healthy (both initial setup and post-restart). 90s gives enough
@@ -148,31 +154,35 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			svcName := "healthserver-lb"
 
 			// Setup creates NLB targeting master nodes, waits for ALL targets healthy
-			lbDNS, observer, svcCfg, setupTimes := setupHealthTransition(
+			_, observer, svcCfg, setupTimes, clientPodName := setupHealthTransition(
 				ctx, cs, ns, deployName, svcName, image,
 				replicas, startupDelay,
 			)
 
+			// The in-cluster client is already running (deployed in setup).
+			// Start the TG observer for health state tracking, and push
+			// TG snapshots to the aggregator every 2s so all state changes
+			// from the AWS perspective appear in the aggregator timeline.
 			observer.Start(ctx)
-			framework.Logf("[observer] started TG health polling (1s interval)")
-			client := health.NewClient(fmt.Sprintf("http://%s:%d/", lbDNS, healthserverPort), defaultClientInterval, defaultClientWorkers)
-			client.Start(ctx)
-			framework.Logf("[client] started %d workers sending requests to %s every %s", defaultClientWorkers, lbDNS, defaultClientInterval)
-			defer func() { client.Stop(); observer.Stop() }()
+			stopTGPush := startTGSnapshotPusher(ctx, cs, ns.Name, observer)
+			framework.Logf("[observer] started TG health polling (1s) + aggregator push (2s)")
+			framework.Logf("[client-pod] in-cluster client %s already sending requests", clientPodName)
+			defer func() { stopTGPush(); observer.Stop() }()
 
-			// Steady state: 90s after all targets healthy — confirms stable
-			// routing to all replicas before triggering the test scenario.
+			// Steady state: 90s for the in-cluster client to establish
+			// traffic to all replicas before triggering the test scenario.
 			By(fmt.Sprintf("verifying steady state for %s", postHealthyObserve))
 			time.Sleep(postHealthyObserve)
 
-			steadyRecords := client.Records()
+			// Fetch steady-state records from the in-cluster client
+			steadyRecords := fetchClientRecords(ctx, cs, ns.Name, clientPodName)
 			steadyNonReady := 0
 			for _, r := range steadyRecords {
 				if r.IsNonReadyReq {
 					steadyNonReady++
 				}
 			}
-			framework.Logf("[steady] %d requests, %d non-ready", len(steadyRecords), steadyNonReady)
+			framework.Logf("[steady] %d requests from in-cluster client, %d non-ready", len(steadyRecords), steadyNonReady)
 			Expect(steadyNonReady).To(Equal(0), "pre-readyz responses during steady state")
 
 			By("listing pods to identify target for rollout simulation")
@@ -214,8 +224,17 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 				podNodeMap[newPod] = newPodObj.Spec.NodeName
 			}
 
-			// Wait for the restarted target to become healthy again, then observe
-			// for postHealthyObserve to confirm stable routing.
+			// First wait for the TG to detect the unhealthy target (HC
+			// needs threshold×interval to detect). Without this, the next
+			// waitForAllTGTargetsHealthy returns immediately because the TG
+			// hasn't processed the failure yet.
+			By("waiting for TG to detect unhealthy target")
+			waitForTGUnhealthy(ctx, observer, 3*time.Minute)
+
+			// Now wait for the restarted target to recover and become healthy.
+			By("waiting for TG to detect unhealthy target")
+			waitForTGUnhealthy(ctx, observer, 3*time.Minute)
+
 			By("waiting for restarted target to become healthy")
 			err = waitForAllTGTargetsHealthy(ctx, observer, 10*time.Minute)
 			framework.ExpectNoError(err, "restarted target healthy")
@@ -223,7 +242,8 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			By(fmt.Sprintf("observing post-recovery traffic for %s", postHealthyObserve))
 			time.Sleep(postHealthyObserve)
 
-			allRecords := client.Records()
+			// Fetch all request records from the in-cluster client pod
+			allRecords := fetchClientRecords(ctx, cs, ns.Name, clientPodName)
 			allEvents := observer.Events()
 
 			tl := computeTimeline(targetPod, knownServers, t5, t71, allRecords, allEvents)
@@ -273,13 +293,12 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			deployName := "healthserver"
 			svcName := "healthserver-lb"
 
-			lbDNS, observer, svcCfg, setupTimes := setupHealthTransition(
+			_, observer, svcCfg, setupTimes, clientPodName := setupHealthTransition(
 				ctx, cs, ns, deployName, svcName, image,
 				replicas, startupDelay,
 			)
 
-			// Apply CAPA fix TG attributes BEFORE collecting TG config for report
-			// and BEFORE starting the observer/client.
+			// Apply CAPA fix TG attributes BEFORE starting the observer.
 			capaAttrs := map[string]string{
 				"target_health_state.unhealthy.connection_termination.enabled": "false",
 				"target_health_state.unhealthy.draining_interval_seconds":      "300",
@@ -296,16 +315,15 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			fetchTGHealthCheckConfig(ctx, &svcCfg)
 
 			observer.Start(ctx)
-			framework.Logf("[observer] started TG health polling (1s interval)")
-			client := health.NewClient(fmt.Sprintf("http://%s:%d/", lbDNS, healthserverPort), defaultClientInterval, defaultClientWorkers)
-			client.Start(ctx)
-			framework.Logf("[client] started %d workers sending requests to %s every %s", defaultClientWorkers, lbDNS, defaultClientInterval)
-			defer func() { client.Stop(); observer.Stop() }()
+			stopTGPush := startTGSnapshotPusher(ctx, cs, ns.Name, observer)
+			framework.Logf("[observer] started TG health polling (1s) + aggregator push (2s)")
+			framework.Logf("[client-pod] in-cluster client %s already sending requests", clientPodName)
+			defer func() { stopTGPush(); observer.Stop() }()
 
 			By(fmt.Sprintf("verifying steady state for %s", postHealthyObserve))
 			time.Sleep(postHealthyObserve)
 
-			steadyRecords := client.Records()
+			steadyRecords := fetchClientRecords(ctx, cs, ns.Name, clientPodName)
 			steadyNonReady := 0
 			for _, r := range steadyRecords {
 				if r.IsNonReadyReq {
@@ -347,6 +365,9 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 				podNodeMap[newPod] = newPodObj.Spec.NodeName
 			}
 
+			By("waiting for TG to detect unhealthy target")
+			waitForTGUnhealthy(ctx, observer, 3*time.Minute)
+
 			By("waiting for restarted target to become healthy")
 			err = waitForAllTGTargetsHealthy(ctx, observer, 10*time.Minute)
 			framework.ExpectNoError(err, "restarted target healthy")
@@ -354,7 +375,8 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			By(fmt.Sprintf("observing post-recovery traffic for %s", postHealthyObserve))
 			time.Sleep(postHealthyObserve)
 
-			allRecords := client.Records()
+			// Fetch all request records from the in-cluster client pod
+			allRecords := fetchClientRecords(ctx, cs, ns.Name, clientPodName)
 			allEvents := observer.Events()
 
 			tl := computeTimeline(targetPod, knownServers, t5, t71, allRecords, allEvents)
@@ -408,17 +430,16 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			deployName := "healthserver"
 			svcName := "healthserver-lb"
 
-			lbDNS, observer, svcCfg, setupTimes := setupHealthTransition(
+			_, observer, svcCfg, setupTimes, clientPodName := setupHealthTransition(
 				ctx, cs, ns, deployName, svcName, image,
 				replicas, startupDelay,
 			)
 
 			observer.Start(ctx)
-			framework.Logf("[observer] started TG health polling (1s interval)")
-			client := health.NewClient(fmt.Sprintf("http://%s:%d/", lbDNS, healthserverPort), defaultClientInterval, defaultClientWorkers)
-			client.Start(ctx)
-			framework.Logf("[client] started %d workers sending requests to %s every %s", defaultClientWorkers, lbDNS, defaultClientInterval)
-			defer func() { client.Stop(); observer.Stop() }()
+			stopTGPush := startTGSnapshotPusher(ctx, cs, ns.Name, observer)
+			framework.Logf("[observer] started TG health polling (1s) + aggregator push (2s)")
+			framework.Logf("[client-pod] in-cluster client %s already sending requests", clientPodName)
+			defer func() { stopTGPush(); observer.Stop() }()
 
 			By(fmt.Sprintf("verifying steady state for %s", postHealthyObserve))
 			time.Sleep(postHealthyObserve)
@@ -451,7 +472,8 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			By(fmt.Sprintf("observing recovery for %s", recoveryObserveDuration))
 			time.Sleep(recoveryObserveDuration)
 
-			allRecords := client.Records()
+			// Fetch all records from the in-cluster client
+			allRecords := fetchClientRecords(ctx, cs, ns.Name, clientPodName)
 			allEvents := observer.Events()
 
 			tl := computeTimeline52(targetPod, t5, t8, allRecords, allEvents)
@@ -460,7 +482,7 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 			tl.T2 = setupTimes.T2
 			tl.T3 = setupTimes.T3
 			// t4: first successful client request
-			for _, r := range client.Records() {
+			for _, r := range allRecords {
 				if r.Error == "" && r.HTTPStatus > 0 {
 					tl.T4 = r.Timestamp
 					break
@@ -495,17 +517,23 @@ func setupHealthTransition(
 	deployName, svcName, image string,
 	replicas int32,
 	startupDelay time.Duration,
-) (lbDNS string, observer *health.Observer, cfg serviceConfig, setupTimes transitionTimeline) {
+) (lbDNS string, observer *health.Observer, cfg serviceConfig, setupTimes transitionTimeline, clientPodName string) {
+
+	// Deploy the aggregator first — servers and client will connect to it.
+	// The aggregator runs on a worker node with normal networking.
+	By("deploying aggregator pod + service on worker node")
+	aggregatorURL := deployAggregator(ctx, cs, ns.Name, image)
+	framework.Logf("[aggregator] ready at %s", aggregatorURL)
 
 	// Grant the default SA in this namespace permission to use hostNetwork
 	// via the OpenShift hostnetwork-v2 SCC. Required because the healthserver
 	// pod uses hostNetwork: true to match KAS static pod behavior.
-	By("granting hostnetwork-v2 SCC to default service account")
+	By("granting privileged SCC to default service account")
 	grantHostNetworkSCC(ctx, cs, ns.Name)
 
 	// t0: deployment created — pods begin scheduling on master nodes
 	By("creating healthserver Deployment (scheduled on master nodes, hostNetwork)")
-	deploy := buildHealthserverDeployment(ns.Name, deployName, replicas, startupDelay, image)
+	deploy := buildHealthserverDeployment(ns.Name, deployName, replicas, startupDelay, image, aggregatorURL)
 	setupTimes.T0 = time.Now()
 	_, err := cs.AppsV1().Deployments(ns.Name).Create(ctx, deploy, metav1.CreateOptions{})
 	framework.ExpectNoError(err, "create deployment")
@@ -531,8 +559,14 @@ func setupHealthTransition(
 
 	DeferCleanup(func(cleanupCtx context.Context) {
 		framework.Logf("cleaning up health transition resources")
-		_ = cs.AppsV1().Deployments(ns.Name).Delete(cleanupCtx, deployName, metav1.DeleteOptions{})
+		// Clean up all pods/deployments/services created by the test.
+		// Order: delete NLB service first (triggers LB deletion), then
+		// pods, then wait for LB to be fully removed from AWS.
 		_ = cs.CoreV1().Services(ns.Name).Delete(cleanupCtx, svcName, metav1.DeleteOptions{})
+		_ = cs.AppsV1().Deployments(ns.Name).Delete(cleanupCtx, deployName, metav1.DeleteOptions{})
+		_ = cs.CoreV1().Pods(ns.Name).Delete(cleanupCtx, "healthtest-aggregator", metav1.DeleteOptions{})
+		_ = cs.CoreV1().Services(ns.Name).Delete(cleanupCtx, "healthtest-aggregator", metav1.DeleteOptions{})
+		_ = cs.CoreV1().Pods(ns.Name).Delete(cleanupCtx, "healthtest-client", metav1.DeleteOptions{})
 		if lbDNS != "" {
 			waitForLBDeletion(cleanupCtx, lbDNS)
 		}
@@ -599,7 +633,13 @@ func setupHealthTransition(
 	// t3: all TG targets healthy — HC passed and propagated through Hyperplane
 	setupTimes.T3 = time.Now()
 
-	return lbDNS, observer, cfg, setupTimes
+	// Deploy in-cluster client on a worker node. The client sends requests
+	// to the NLB with ~1ms RTT (vs ~430ms from external), achieving much
+	// higher throughput for better detection coverage.
+	By("deploying in-cluster client on worker node")
+	clientPodName = deployInClusterClient(ctx, cs, ns.Name, image, lbDNS, aggregatorURL)
+
+	return lbDNS, observer, cfg, setupTimes, clientPodName
 }
 
 // waitForAllTGTargetsHealthy polls DescribeTargetHealth directly (via
@@ -636,6 +676,49 @@ func waitForAllTGTargetsHealthy(ctx context.Context, observer *health.Observer, 
 		}
 		return allHealthy, nil
 	})
+}
+
+// waitForTGUnhealthy blocks until at least one TG target reports unhealthy.
+// This ensures the NLB HC has detected the failure before we start waiting
+// for recovery. Without this, waitForAllTGTargetsHealthy may return
+// immediately if called before the HC threshold is met.
+func waitForTGUnhealthy(ctx context.Context, observer *health.Observer, timeout time.Duration) {
+	_ = wait.PollUntilContextTimeout(ctx, 2*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+		snap, err := observer.PollOnce(ctx)
+		if err != nil {
+			return false, nil
+		}
+		if snap.UnhealthyCount > 0 {
+			framework.Logf("[tg-wait] detected %d unhealthy target(s)", snap.UnhealthyCount)
+			return true, nil
+		}
+		return false, nil
+	})
+}
+
+// startTGSnapshotPusher starts a goroutine that pushes TG health snapshots
+// to the aggregator every 2 seconds. This runs the observer's PollOnce and
+// sends the result to the aggregator so all TG state changes are captured
+// in the aggregator's timeline. Returns a cancel function to stop the goroutine.
+func startTGSnapshotPusher(ctx context.Context, cs clientset.Interface, namespace string, observer *health.Observer) context.CancelFunc {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				snap, err := observer.PollOnce(ctx)
+				if err != nil {
+					continue
+				}
+				pushTGSnapshotToAggregator(ctx, cs, namespace, snap)
+			}
+		}
+	}()
+	return cancel
 }
 
 // fetchTGHealthCheckConfig reads the TG's health check settings from the AWS API
@@ -792,7 +875,7 @@ func computeTimeline(
 		// time to match the test's clock for consistent delta calculations.
 		if tl.T8.IsZero() && r.ServerState == "ready" && r.FirstReadyzTime != "never" && r.FirstReadyzTime != "" {
 			if parsed, err := time.Parse(time.RFC3339Nano, r.FirstReadyzTime); err == nil {
-				tl.T8 = parsed.Local()
+				tl.T8 = parsed.UTC()
 			}
 		}
 
@@ -887,11 +970,14 @@ func computeTimeline52(
 
 // ─── Report (single block, no per-line logger timestamps) ───────────────────
 
+// fmtT formats a time in UTC to avoid timezone mismatches between the
+// test binary (local TZ) and containers (UTC). All timestamps in the
+// report use UTC for consistent comparison.
 func fmtT(t time.Time) string {
 	if t.IsZero() {
 		return "N/A"
 	}
-	return t.Format(time.RFC3339)
+	return t.UTC().Format(time.RFC3339)
 }
 
 func fmtDelta(base, t time.Time) string {
@@ -1041,11 +1127,11 @@ func buildReport(
 
 	// ── Per-phase request breakdown ──
 	// Phases are defined by the timeline milestones:
-	//   Warmup:     t3→t5  (all targets healthy, steady-state traffic)
-	//   Shutdown:   t5→t7.1 or t5→t8  (readyz→503, target still serving)
-	//   Restart:    t7.1→t9  (pod deleted → new target healthy)
-	//   Recovery:   t9→end  (new target healthy, traffic flowing)
-	// For Scenario 5.2 (no restart): Shutdown=t5→t8, Recovery=t8→end
+	//   Warmup:           t3→t5  (all targets healthy, steady-state traffic)
+	//   GracefulShutdown: t5→t7  (SIGTERM received, readyz→503, NLB still routing)
+	//   Restart:          t7→t9  (NLB stopped routing, pod terminated, new pod starting)
+	//   Recovery:         t9→end (new target healthy, traffic flowing)
+	// For Scenario 5.2 (no restart): GracefulShutdown=t5→t8, Recovery=t8→end
 	type phaseStats struct {
 		name                   string
 		from, to               time.Time
@@ -1077,12 +1163,12 @@ func buildReport(
 
 	if !tl.T71.IsZero() {
 		// Scenario 5.5: has restart phase
-		phases = append(phases, classifyPhase("Shutdown (t5→t7.1)", tl.T5, tl.T71))
-		phases = append(phases, classifyPhase("Restart (t7.1→t9)", tl.T71, tl.T9))
+		phases = append(phases, classifyPhase("GracefulShutdown (t5→t7)", tl.T5, tl.T7))
+		phases = append(phases, classifyPhase("Restart (t7→t9)", tl.T7, tl.T9))
 		phases = append(phases, classifyPhase("Recovery (t9→end)", tl.T9, time.Time{}))
 	} else {
 		// Scenario 5.2: no restart
-		phases = append(phases, classifyPhase("Shutdown (t5→t8)", tl.T5, tl.T8))
+		phases = append(phases, classifyPhase("GracefulShutdown (t5→t8)", tl.T5, tl.T8))
 		phases = append(phases, classifyPhase("Recovery (t8→end)", tl.T8, time.Time{}))
 	}
 
@@ -1220,7 +1306,7 @@ func buildReport(
 	addEntry(tl.T5, "t5  readyz→503", "")
 	addEntry(tl.T6, "t6  TG unhealthy", fmtDelta(tl.T5, tl.T6))
 	addEntry(tl.T7, "t7  last routed req", fmtDelta(tl.T5, tl.T7))
-	addEntry(tl.T71, "t7.1 pod deleted", fmtDelta(tl.T5, tl.T71))
+	addEntry(tl.T71, "t7.1 pod deleted (SIGTERM sent)", fmtDelta(tl.T5, tl.T71))
 	addEntry(tl.T73, "t7.3 new TCP up", fmtDelta(tl.T71, tl.T73))
 	if !tl.T74.IsZero() {
 		addEntry(tl.T74, "t7.4 pre-readyz req ← BUG", fmtDelta(tl.T73, tl.T74))
@@ -1363,7 +1449,7 @@ func buildVerdict52(tl transitionTimeline) string {
 // master/control-plane nodes to match KAS topology. Includes tolerations for
 // both master and control-plane taints, and topologySpreadConstraints to
 // distribute pods across nodes.
-func buildHealthserverDeployment(namespace, name string, replicas int32, startupDelay time.Duration, image string) *appsv1.Deployment {
+func buildHealthserverDeployment(namespace, name string, replicas int32, startupDelay time.Duration, image string, aggregatorURL ...string) *appsv1.Deployment {
 	labels := map[string]string{"app": name}
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1405,10 +1491,20 @@ func buildHealthserverDeployment(namespace, name string, replicas int32, startup
 					Containers: []v1.Container{{
 						Name:  "healthserver",
 						Image: image,
-						Args: []string{
-							fmt.Sprintf("--port=%d", healthserverPort),
-							fmt.Sprintf("--startup-delay=%s", startupDelay),
-						},
+						Args: func() []string {
+							// Use the unified binary with "serve" subcommand.
+							// If aggregatorURL is provided, pass it so the server
+							// pushes lifecycle events to the aggregator.
+							args := []string{
+								"serve",
+								fmt.Sprintf("--port=%d", healthserverPort),
+								fmt.Sprintf("--startup-delay=%s", startupDelay),
+							}
+							if len(aggregatorURL) > 0 && aggregatorURL[0] != "" {
+								args = append(args, fmt.Sprintf("--aggregator=%s", aggregatorURL[0]))
+							}
+							return args
+						}(),
 						Ports: []v1.ContainerPort{{
 							Name:          "http",
 							ContainerPort: healthserverPort,
@@ -1425,12 +1521,22 @@ func buildHealthserverDeployment(namespace, name string, replicas int32, startup
 								Type: v1.SeccompProfileTypeRuntimeDefault,
 							},
 						},
-						Env: []v1.EnvVar{{
-							Name: "POD_NAME",
-							ValueFrom: &v1.EnvVarSource{
-								FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.name"},
+						Env: []v1.EnvVar{
+							{
+								Name: "POD_NAME",
+								ValueFrom: &v1.EnvVarSource{
+									FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.name"},
+								},
 							},
-						}},
+							{
+								// POD_IP is used to register with the aggregator
+								// using the real node IP (hostNetwork pod).
+								Name: "POD_IP",
+								ValueFrom: &v1.EnvVarSource{
+									FieldRef: &v1.ObjectFieldSelector{FieldPath: "status.podIP"},
+								},
+							},
+						},
 					}},
 				},
 			},
@@ -1513,6 +1619,253 @@ func grantHostNetworkSCC(ctx context.Context, cs clientset.Interface, namespace 
 	}
 	_, err := cs.RbacV1().RoleBindings(namespace).Create(ctx, rb, metav1.CreateOptions{})
 	framework.ExpectNoError(err, "grant privileged SCC to default SA")
+}
+
+// ─── In-cluster aggregator + client deployment ─────────────────────────────
+
+// deployAggregator creates a Pod and ClusterIP Service for the aggregator
+// on a worker node. Returns the service DNS name for other pods to connect.
+func deployAggregator(ctx context.Context, cs clientset.Interface, namespace, image string) string {
+	svcName := "healthtest-aggregator"
+	podName := "healthtest-aggregator"
+
+	// Pod
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: namespace,
+			Labels:    map[string]string{"app": "healthtest-aggregator"},
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{
+				Name:  "aggregator",
+				Image: image,
+				Args:  []string{"aggregator", fmt.Sprintf("--port=%d", aggregatorPort), "--scrape-interval=1s"},
+				Ports: []v1.ContainerPort{{
+					Name:          "http",
+					ContainerPort: int32(aggregatorPort),
+				}},
+				ReadinessProbe: &v1.Probe{
+					ProbeHandler: v1.ProbeHandler{
+						HTTPGet: &v1.HTTPGetAction{
+							Path: "/healthz",
+							Port: intstr.FromInt(aggregatorPort),
+						},
+					},
+					PeriodSeconds: 2,
+				},
+			}},
+		},
+	}
+	_, err := cs.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "create aggregator pod")
+
+	// ClusterIP Service so servers and client can reach the aggregator by DNS
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      svcName,
+			Namespace: namespace,
+		},
+		Spec: v1.ServiceSpec{
+			Selector: map[string]string{"app": "healthtest-aggregator"},
+			Ports: []v1.ServicePort{{
+				Port:       int32(aggregatorPort),
+				TargetPort: intstr.FromInt(aggregatorPort),
+			}},
+		},
+	}
+	_, err = cs.CoreV1().Services(namespace).Create(ctx, svc, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "create aggregator service")
+
+	// Wait for aggregator pod ready
+	err = wait.PollUntilContextTimeout(ctx, 2*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		p, err := cs.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		for _, c := range p.Status.Conditions {
+			if c.Type == v1.PodReady && c.Status == v1.ConditionTrue {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	framework.ExpectNoError(err, "aggregator pod ready")
+
+	// Return the in-cluster DNS name for the aggregator service
+	return fmt.Sprintf("http://%s.%s.svc:%d", svcName, namespace, aggregatorPort)
+}
+
+// deployInClusterClient creates a Pod on a worker node that sends HTTP
+// requests to the NLB. Returns the pod name for result fetching.
+func deployInClusterClient(ctx context.Context, cs clientset.Interface, namespace, image, nlbDNS, aggregatorURL string) string {
+	podName := "healthtest-client"
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: namespace,
+			Labels:    map[string]string{"app": "healthtest-client"},
+		},
+		Spec: v1.PodSpec{
+			// Schedule on worker nodes (NOT control-plane)
+			Affinity: &v1.Affinity{
+				NodeAffinity: &v1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+						NodeSelectorTerms: []v1.NodeSelectorTerm{{
+							MatchExpressions: []v1.NodeSelectorRequirement{{
+								Key:      "node-role.kubernetes.io/worker",
+								Operator: v1.NodeSelectorOpExists,
+							}},
+						}},
+					},
+				},
+			},
+			Containers: []v1.Container{{
+				Name:  "client",
+				Image: image,
+				// POD_IP is used by the client to register with the
+				// aggregator using its real pod IP (not localhost).
+				Env: []v1.EnvVar{{
+					Name: "POD_IP",
+					ValueFrom: &v1.EnvVarSource{
+						FieldRef: &v1.ObjectFieldSelector{FieldPath: "status.podIP"},
+					},
+				}},
+				Args: []string{
+					"client",
+					fmt.Sprintf("--url=http://%s:%d/", nlbDNS, healthserverPort),
+					fmt.Sprintf("--workers=%d", defaultClientWorkers),
+					fmt.Sprintf("--interval=%s", defaultClientInterval),
+					fmt.Sprintf("--port=%d", clientPort),
+					fmt.Sprintf("--aggregator=%s", aggregatorURL),
+				},
+				Ports: []v1.ContainerPort{{
+					Name:          "http",
+					ContainerPort: int32(clientPort),
+				}},
+				ReadinessProbe: &v1.Probe{
+					ProbeHandler: v1.ProbeHandler{
+						HTTPGet: &v1.HTTPGetAction{
+							Path: "/healthz",
+							Port: intstr.FromInt(clientPort),
+						},
+					},
+					PeriodSeconds: 2,
+				},
+			}},
+		},
+	}
+	_, err := cs.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "create client pod")
+
+	// Wait for client pod ready (starts sending requests immediately)
+	err = wait.PollUntilContextTimeout(ctx, 2*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		p, err := cs.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		for _, c := range p.Status.Conditions {
+			if c.Type == v1.PodReady && c.Status == v1.ConditionTrue {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	framework.ExpectNoError(err, "client pod ready")
+	framework.Logf("[client-pod] started on worker node, sending requests to NLB")
+
+	return podName
+}
+
+// fetchClientRecords retrieves all request records from the in-cluster
+// client pod via the K8s API server proxy. The client pod runs on a worker
+// node with normal networking, so the API proxy works.
+func fetchClientRecords(ctx context.Context, cs clientset.Interface, namespace, clientPodName string) []health.RequestRecord {
+	result := cs.CoreV1().RESTClient().Get().
+		AbsPath(fmt.Sprintf("/api/v1/namespaces/%s/pods/%s:%d/proxy/records", namespace, clientPodName, clientPort)).
+		Timeout(30 * time.Second).
+		Do(ctx)
+	if err := result.Error(); err != nil {
+		framework.Logf("warning: failed to fetch client records: %v", err)
+		return nil
+	}
+	raw, err := result.Raw()
+	if err != nil {
+		framework.Logf("warning: failed to read client records: %v", err)
+		return nil
+	}
+
+	// The client returns ClientRecord (types from the unified binary).
+	// Map to health.RequestRecord for compatibility with existing analysis.
+	type clientRecord struct {
+		Timestamp       time.Time `json:"timestamp"`
+		TargetIP        string    `json:"target_ip"`
+		TCPDialDuration int64     `json:"tcp_dial_ms"`
+		HTTPStatus      int       `json:"http_status"`
+		ServerState     string    `json:"server_state"`
+		ServerID        string    `json:"server_id"`
+		FirstReadyzTime string    `json:"first_readyz_time"`
+		IsNonReadyReq   bool      `json:"is_non_ready_req"`
+		Error           string    `json:"error,omitempty"`
+	}
+	var crs []clientRecord
+	if err := json.Unmarshal(raw, &crs); err != nil {
+		framework.Logf("warning: failed to parse client records: %v", err)
+		return nil
+	}
+
+	records := make([]health.RequestRecord, len(crs))
+	for i, cr := range crs {
+		records[i] = health.RequestRecord{
+			Timestamp:       cr.Timestamp,
+			TargetIP:        cr.TargetIP,
+			TCPDialDuration: time.Duration(cr.TCPDialDuration) * time.Millisecond,
+			HTTPStatus:      cr.HTTPStatus,
+			ServerState:     cr.ServerState,
+			ServerID:        cr.ServerID,
+			FirstReadyzTime: cr.FirstReadyzTime,
+			IsNonReadyReq:   cr.IsNonReadyReq,
+			Error:           cr.Error,
+		}
+	}
+	framework.Logf("[client-pod] fetched %d records from in-cluster client", len(records))
+	return records
+}
+
+// pushTGSnapshotToAggregator sends a TG health snapshot to the aggregator
+// via K8s API proxy. Non-blocking — errors are logged but don't fail the test.
+func pushTGSnapshotToAggregator(ctx context.Context, cs clientset.Interface, namespace string, snap health.TargetSnapshot) {
+	payload := struct {
+		Timestamp      time.Time         `json:"timestamp"`
+		Targets        map[string]string `json:"targets"`
+		HealthyCount   int               `json:"healthy_count"`
+		UnhealthyCount int               `json:"unhealthy_count"`
+		InitialCount   int               `json:"initial_count"`
+	}{
+		Timestamp:      snap.Timestamp,
+		Targets:        snap.Targets,
+		HealthyCount:   snap.HealthyCount,
+		UnhealthyCount: snap.UnhealthyCount,
+		InitialCount:   snap.InitialCount,
+	}
+	data, _ := json.Marshal(payload)
+	cs.CoreV1().RESTClient().Post().
+		AbsPath(fmt.Sprintf("/api/v1/namespaces/%s/pods/healthtest-aggregator:%d/proxy/tg-snapshot", namespace, aggregatorPort)).
+		Body(data).
+		Do(ctx)
+}
+
+// fetchAggregatorTimeline retrieves the merged event timeline from the aggregator.
+func fetchAggregatorTimeline(ctx context.Context, cs clientset.Interface, namespace string) []map[string]interface{} {
+	result := cs.CoreV1().RESTClient().Get().
+		AbsPath(fmt.Sprintf("/api/v1/namespaces/%s/pods/healthtest-aggregator:%d/proxy/timeline", namespace, aggregatorPort)).
+		Timeout(30 * time.Second).
+		Do(ctx)
+	raw, _ := result.Raw()
+	var timeline []map[string]interface{}
+	json.Unmarshal(raw, &timeline)
+	return timeline
 }
 
 func ptrBool(b bool) *bool    { return &b }

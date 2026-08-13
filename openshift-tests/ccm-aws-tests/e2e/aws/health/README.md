@@ -24,8 +24,10 @@ openshift-tests/ccm-aws-tests/
 │   ├── main.go                 # /readyz control, X-Server-State headers, admin API
 │   └── Dockerfile              # Multi-stage scratch build (~10MB)
 ├── e2e/aws/
-│   ├── lb_health_transition.go # Ginkgo test scenarios (5.5, 5.5-CAPA, 5.2)
-│   └── health/                 # Extractable package (zero parent-path imports)
+│   ├── lb_health_transition.go # Ginkgo scenarios (5.5, 5.5-CAPA, 5.2, 5.5-CLB, 5.5-SDK×4)
+│   ├── sdk_nlb.go              # SDK-managed NLB create/delete, preserve_client_ip helper
+│   └── health/
+│       ├── TEST_CASES.md       # Human-readable scenario docs + diagrams
 │       ├── types.go            # HealthEvent, RequestRecord, TargetSnapshot
 │       ├── observer.go         # TG health polling, PollOnce, TG attribute R/W
 │       ├── client.go           # HTTP client with httptrace (new TCP per request)
@@ -162,6 +164,33 @@ Flow:
   4. Report timing table
 ```
 
+### Scenario 5.5-CLB — Pre-Readyz CLB Baseline (OCPBUGS-86789)
+
+Same flow as 5.5 but uses a Classic Load Balancer (no NLB annotation).
+Control group for NLB-specific behaviour.
+
+### SDK-Managed NLB Variants (KAS-equivalent)
+
+Four comparable tests using AWS SDK to provision the NLB (same stack as the
+real KAS NLB). Healthserver runs as a **DaemonSet** on control-plane nodes
+(same-node replacement on rollout). See **`TEST_CASES.md`** for diagrams and
+run filters.
+
+| Scenario | Client | preserve_client_ip | Purpose |
+|----------|--------|-------------------|---------|
+| 5.5-SDK | 1 pod, 32 workers | true | Baseline (single client IP → skewed traffic) |
+| 5.5-SDK-no-cip | 1 pod, 32 workers | false | Isolate stickiness with single client |
+| 5.5-SDK-multi | DaemonSet / worker | true | **Recommended** — even traffic, KAS-faithful |
+| 5.5-SDK-multi-no-cip | DaemonSet / worker | false | Multi-client control (no stickiness) |
+
+**Plan:** `ai-plans/lb-health-transition-e2e-plan-v21-multi-client.md`  
+**Depends on:** v19 (SDK NLB), v20 (healthserver DaemonSet)
+
+```sh
+# Example: recommended variant
+$BIN run-test "...multi-client (OCPBUGS-86789) should not route..."
+```
+
 ## Components
 
 ### Healthserver (`cmd/healthserver/`)
@@ -287,11 +316,14 @@ done < <($BIN list tests 2>/dev/null \
   | jq -r '.[].name' \
   | grep "health-transition")
 
-# Run a specific scenario
-$BIN run-test "...(OCPBUGS-86789) should not route to pre-readyz targets..."
-$BIN run-test "...(SPLAT-307) should stop routing within shutdown-delay..."
-$BIN run-test "...(OCPBUGS-86789) should not route to pre-readyz targets with connection-termination..."
+# Run SDK variant (see TEST_CASES.md for all filters)
+$BIN run-test "...SDK-managed NLB pre-readyz routing (KAS-equivalent)..."
+$BIN run-test "...preserve_client_ip=false..."
+$BIN run-test "...multi-client (OCPBUGS-86789) should not route..."
+$BIN run-test "...multi-client preserve_client_ip=false..."
 ```
+
+**Full scenario documentation:** `e2e/aws/health/TEST_CASES.md`
 
 ## Report Output
 
@@ -334,10 +366,12 @@ avoid per-line logger timestamps) containing:
 - Multiple iterations per scenario (configurable repeat count)
 - Configurable delays via environment variables
 - Per-second CSV output matching SPLAT-307 format
-- CLB comparison variant (control group)
-- JSON machine-readable report for cross-run comparison
+- JSON machine-readable report for cross-run comparison (SDK 4-variant matrix)
 - EC2 instance ID → node name mapping in observer events
 - Scenario 5.6: node replacement (deregistration path)
 - Scenario 5.7: connection termination regression guard (OCPBUGS-55626)
 - Periodic CI job in CCCMO
+
+**Done:** CLB baseline (5.5-CLB), SDK-managed NLB (v19), DaemonSet rollout (v20),
+SDK 4-variant matrix (v21)
 - Multi-region runs (us-west-2, eu-west-1)

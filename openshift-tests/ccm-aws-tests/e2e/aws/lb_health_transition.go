@@ -124,7 +124,7 @@ type serviceConfig struct {
 	Topology string // e.g., "HighlyAvailable"
 }
 
-var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
+var _ = Describe(healthTransitionTestPrefix, func() {
 	f := framework.NewDefaultFramework("cloud-provider-aws")
 	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
 
@@ -137,7 +137,7 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 	})
 
 	// ── Scenario 5.5 ───────────────────────────────────────────────────
-	Context("pre-readyz routing detection (OCPBUGS-86789)", func() {
+	Context("NLB pre-readyz routing detection (OCPBUGS-86789)", func() {
 		It("should not route to pre-readyz targets "+
 			"when healthy targets are available", func(ctx context.Context) {
 
@@ -277,7 +277,7 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 	//   target_health_state.unhealthy.connection_termination.enabled = false
 	//   target_health_state.unhealthy.draining_interval_seconds = 300
 	// This simulates the NLB configuration applied by CAPA (OCPBUGS-55626).
-	Context("pre-readyz routing with CAPA TG attributes (OCPBUGS-86789)", func() {
+	Context("NLB pre-readyz routing with CAPA TG attributes (OCPBUGS-86789)", func() {
 		It("should not route to pre-readyz targets "+
 			"with connection-termination disabled and draining=300s", func(ctx context.Context) {
 
@@ -406,7 +406,7 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 	})
 
 	// ── Scenario 5.2 ───────────────────────────────────────────────────
-	Context("shutdown propagation measurement (SPLAT-307)", func() {
+	Context("NLB shutdown propagation measurement (SPLAT-307)", func() {
 		It("should stop routing within shutdown-delay after "+
 			"readyz starts failing", func(ctx context.Context) {
 
@@ -497,6 +497,124 @@ var _ = Describe(healthTransitionTestPrefix+" NLB", func() {
 				allRecords, allEvents, observer.Snapshots())
 
 			report += buildVerdict52(tl)
+
+			framework.Logf("\n%s", report)
+		})
+	})
+
+	// ── Scenario 5.5 CLB baseline ───────────────────────────────────────
+	// Same as Scenario 5.5 but using Classic Load Balancer instead of NLB.
+	// Compares CLB and NLB health transition behavior to determine if the
+	// pre-readyz routing issue is NLB-specific (Hyperplane) or broader.
+	Context("CLB pre-readyz routing detection baseline (OCPBUGS-86789)", func() {
+		It("should not route to pre-readyz targets "+
+			"when healthy targets are available", func(ctx context.Context) {
+
+			image := os.Getenv(envHealthserverImage)
+			if image == "" {
+				Skip(fmt.Sprintf("%s not set", envHealthserverImage))
+			}
+
+			replicas := int32(3)
+			startupDelay := 60 * time.Second
+			shutdownDelay := kasShutdownDelay
+
+			deployName := "healthserver"
+			svcName := "healthserver-lb"
+
+			// Setup uses CLB (no nlb annotation) with same HC config
+			lbDNS, clbObserver, svcCfg, setupTimes, clientPodName := setupHealthTransitionCLB(
+				ctx, cs, ns, deployName, svcName, image,
+				replicas, startupDelay,
+			)
+			_ = lbDNS
+
+			clbObserver.Start(ctx)
+			// Push CLB health snapshots to aggregator every 2s
+			stopCLBPush := startCLBSnapshotPusher(ctx, cs, ns.Name, clbObserver)
+			framework.Logf("[observer] started CLB health polling (1s) + aggregator push (2s)")
+			framework.Logf("[client-pod] in-cluster client %s already sending requests", clientPodName)
+			defer func() { stopCLBPush(); clbObserver.Stop() }()
+
+			By(fmt.Sprintf("verifying steady state for %s", postHealthyObserve))
+			time.Sleep(postHealthyObserve)
+
+			steadyRecords := fetchClientRecords(ctx, cs, ns.Name, clientPodName)
+			steadyNonReady := 0
+			for _, r := range steadyRecords {
+				if r.IsNonReadyReq {
+					steadyNonReady++
+				}
+			}
+			framework.Logf("[steady] %d requests from in-cluster client, %d non-ready", len(steadyRecords), steadyNonReady)
+			Expect(steadyNonReady).To(Equal(0), "pre-readyz responses during steady state")
+
+			By("listing pods to identify target for rollout simulation")
+			pods, err := cs.CoreV1().Pods(ns.Name).List(ctx, metav1.ListOptions{
+				LabelSelector: fmt.Sprintf("app=%s", deployName),
+			})
+			framework.ExpectNoError(err, "list healthserver pods")
+			Expect(len(pods.Items)).To(BeNumerically(">=", int(replicas)))
+
+			knownServers := make(map[string]bool)
+			podNodeMap := make(map[string]string)
+			for _, p := range pods.Items {
+				knownServers[p.Name] = true
+				podNodeMap[p.Name] = p.Spec.NodeName
+			}
+
+			targetPod := pods.Items[0].Name
+			targetNode := pods.Items[0].Spec.NodeName
+
+			By("deleting target pod (t5/t7.1 — SIGTERM triggers readyz→503)")
+			t5 := time.Now()
+			t71 := t5
+			err = cs.CoreV1().Pods(ns.Name).Delete(ctx, targetPod, metav1.DeleteOptions{})
+			framework.ExpectNoError(err)
+
+			By("waiting for replacement pod")
+			newPod := waitForNewPod(ctx, cs, ns.Name, deployName, targetPod)
+
+			newPodObj, npErr := cs.CoreV1().Pods(ns.Name).Get(ctx, newPod, metav1.GetOptions{})
+			if npErr == nil {
+				podNodeMap[newPod] = newPodObj.Spec.NodeName
+			}
+
+			// Wait for CLB to detect unhealthy, then recover
+			By("waiting for CLB to detect unhealthy instance")
+			waitForCLBUnhealthy(ctx, clbObserver, 3*time.Minute)
+
+			By("waiting for all CLB instances to become healthy")
+			err = clbObserver.WaitForAllHealthy(ctx, int(replicas), 10*time.Minute)
+			framework.ExpectNoError(err, "CLB instances healthy")
+
+			By(fmt.Sprintf("observing post-recovery traffic for %s", postHealthyObserve))
+			time.Sleep(postHealthyObserve)
+
+			allRecords := fetchClientRecords(ctx, cs, ns.Name, clientPodName)
+			allEvents := clbObserver.Events()
+
+			tl := computeTimeline(targetPod, knownServers, t5, t71, allRecords, allEvents)
+			tl.T0 = setupTimes.T0
+			tl.T1 = setupTimes.T1
+			tl.T2 = setupTimes.T2
+			tl.T3 = setupTimes.T3
+			for _, r := range steadyRecords {
+				if r.Error == "" && r.HTTPStatus > 0 {
+					tl.T4 = r.Timestamp
+					break
+				}
+			}
+			tl.TargetPod = targetPod
+			tl.TargetNode = targetNode
+			tl.NewPod = newPod
+			tl.PodNodeMap = podNodeMap
+
+			report := buildReport("5.5-CLB (Pre-Readyz Routing CLB Baseline / OCPBUGS-86789)",
+				tl, svcCfg, replicas, startupDelay, shutdownDelay,
+				allRecords, allEvents, clbObserver.Snapshots())
+
+			report += buildVerdict55(tl, allRecords)
 
 			framework.Logf("\n%s", report)
 		})
@@ -1365,25 +1483,25 @@ func buildVerdict55(tl transitionTimeline, records []health.RequestRecord) strin
 		targetAfterShutdown++
 	}
 
-	// Count requests to the target pod's node during Restart phase (t7.1→t9).
-	// With externalTrafficPolicy: Local, instance target type, the target pod's
-	// node is the NLB target. Any request reaching that node's backend during
-	// restart means the NLB routed to an unhealthy target.
+	// Count requests to the target pod's node during Restart phase (t7→t9).
+	// Start from t7 (last routed request), NOT t7.1 (pod delete/SIGTERM),
+	// because requests between t5→t7 are expected GracefulShutdown traffic
+	// (NLB propagation delay) and are already reported by [SHUTDOWN].
+	// Requests AFTER t7 mean the LB re-routed to the target unexpectedly.
 	var targetDuringRestart int
-	if !tl.T71.IsZero() {
+	if !tl.T7.IsZero() {
 		end := tl.T9
 		if end.IsZero() {
 			end = tl.T10
 		}
 		for _, r := range records {
-			if tl.T71.IsZero() || r.Timestamp.Before(tl.T71) {
+			if r.Timestamp.Before(tl.T7) {
 				continue
 			}
 			if !end.IsZero() && r.Timestamp.After(end) {
 				continue
 			}
-			// Match the target pod OR the new pod (both run on the same node
-			// when the deployment reschedules to the same node)
+			// Match the target pod OR the new pod
 			if r.ServerID == tl.TargetPod || r.ServerID == tl.NewPod {
 				if r.ServerState == "pre-readyz" || r.ServerState == "draining" || r.ServerState == "shutdown" {
 					targetDuringRestart++
@@ -1866,6 +1984,218 @@ func fetchAggregatorTimeline(ctx context.Context, cs clientset.Interface, namesp
 	var timeline []map[string]interface{}
 	json.Unmarshal(raw, &timeline)
 	return timeline
+}
+
+// ─── CLB (Classic Load Balancer) support ────────────────────────────────────
+
+// setupHealthTransitionCLB creates the same infrastructure as setupHealthTransition
+// but uses a Classic Load Balancer instead of NLB. The CLB observer uses the
+// ELB v1 DescribeInstanceHealth API. Everything else (healthserver deployment,
+// aggregator, in-cluster client) is identical.
+func setupHealthTransitionCLB(
+	ctx context.Context,
+	cs clientset.Interface,
+	ns *v1.Namespace,
+	deployName, svcName, image string,
+	replicas int32,
+	startupDelay time.Duration,
+) (lbDNS string, clbObserver *health.CLBObserver, cfg serviceConfig, setupTimes transitionTimeline, clientPodName string) {
+
+	// Deploy aggregator first
+	By("deploying aggregator pod + service on worker node")
+	aggregatorURL := deployAggregator(ctx, cs, ns.Name, image)
+	framework.Logf("[aggregator] ready at %s", aggregatorURL)
+
+	// SCC for hostNetwork
+	By("granting privileged SCC to default service account")
+	grantHostNetworkSCC(ctx, cs, ns.Name)
+
+	// Healthserver deployment (same as NLB)
+	By("creating healthserver Deployment (scheduled on master nodes, hostNetwork)")
+	deploy := buildHealthserverDeployment(ns.Name, deployName, replicas, startupDelay, image, aggregatorURL)
+	setupTimes.T0 = time.Now()
+	_, err := cs.AppsV1().Deployments(ns.Name).Create(ctx, deploy, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "create deployment")
+
+	// CLB Service (no nlb annotation = CLB default)
+	By("creating CLB Service (master-only targets, cross-zone, /readyz HC)")
+	svc := buildHealthTransitionServiceCLB(ns.Name, svcName, deployName)
+	_, err = cs.CoreV1().Services(ns.Name).Create(ctx, svc, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "create CLB service")
+	cfg.ServiceAnnotations = svc.Annotations
+
+	cfg.Platform = "AWS"
+	if region, rErr := common.GetRegionFromInfrastructure(ctx); rErr == nil {
+		cfg.Region = region
+	}
+	if isExternal, tErr := common.IsExternalTopology(ctx); tErr == nil {
+		if isExternal {
+			cfg.Topology = "External (HyperShift)"
+		} else {
+			cfg.Topology = "HighlyAvailable"
+		}
+	}
+
+	DeferCleanup(func(cleanupCtx context.Context) {
+		framework.Logf("cleaning up CLB health transition resources")
+		_ = cs.CoreV1().Services(ns.Name).Delete(cleanupCtx, svcName, metav1.DeleteOptions{})
+		_ = cs.AppsV1().Deployments(ns.Name).Delete(cleanupCtx, deployName, metav1.DeleteOptions{})
+		_ = cs.CoreV1().Pods(ns.Name).Delete(cleanupCtx, "healthtest-aggregator", metav1.DeleteOptions{})
+		_ = cs.CoreV1().Services(ns.Name).Delete(cleanupCtx, "healthtest-aggregator", metav1.DeleteOptions{})
+		_ = cs.CoreV1().Pods(ns.Name).Delete(cleanupCtx, "healthtest-client", metav1.DeleteOptions{})
+		if lbDNS != "" {
+			// CLB deletion is handled by cloud-provider-aws when the Service is deleted
+			waitForLBDeletion(cleanupCtx, lbDNS)
+		}
+	})
+
+	// Wait for deployment
+	By("waiting for Deployment rollout")
+	err = wait.PollUntilContextTimeout(ctx, 5*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
+		d, err := cs.AppsV1().Deployments(ns.Name).Get(ctx, deployName, metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		framework.Logf("deployment ready replicas: %d/%d", d.Status.ReadyReplicas, replicas)
+		return d.Status.ReadyReplicas >= replicas, nil
+	})
+	framework.ExpectNoError(err, "deployment rollout")
+	setupTimes.T1 = time.Now()
+
+	// Wait for CLB provisioning
+	By("waiting for CLB provisioning")
+	err = wait.PollUntilContextTimeout(ctx, 10*time.Second, 10*time.Minute, true, func(ctx context.Context) (bool, error) {
+		s, err := cs.CoreV1().Services(ns.Name).Get(ctx, svcName, metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		if len(s.Status.LoadBalancer.Ingress) > 0 {
+			lbDNS = s.Status.LoadBalancer.Ingress[0].Hostname
+			return lbDNS != "", nil
+		}
+		return false, nil
+	})
+	framework.ExpectNoError(err, "CLB provisioning")
+	setupTimes.T2 = time.Now()
+	cfg.LBDNS = lbDNS
+
+	// Discover CLB by DNS name
+	By("discovering CLB by DNS name")
+	elbClient, err := createAWSClientCLB(ctx)
+	framework.ExpectNoError(err, "create CLB client")
+
+	lbName, err := getCLBByDNSNameWithRetry(ctx, elbClient, lbDNS)
+	framework.ExpectNoError(err, "find CLB")
+	cfg.LBARN = lbName // CLB uses name, not ARN
+	cfg.TGTargetType = "instance (CLB)"
+
+	// Create CLB observer
+	clbObserver = health.NewCLBObserver(elbClient, lbName, 1*time.Second)
+
+	// Wait for all instances healthy
+	By("waiting for ALL CLB instances to become healthy")
+	err = wait.PollUntilContextTimeout(ctx, 5*time.Second, 10*time.Minute, true, func(ctx context.Context) (bool, error) {
+		snap, pollErr := clbObserver.PollOnce(ctx)
+		if pollErr != nil {
+			return false, nil
+		}
+		total := snap.HealthyCount + snap.UnhealthyCount + snap.InitialCount
+		allHealthy := total > 0 && snap.UnhealthyCount == 0 && snap.InitialCount == 0
+		if time.Now().Second()%10 == 0 {
+			var details []string
+			for id, state := range snap.Targets {
+				details = append(details, fmt.Sprintf("%s=%s", id, state))
+			}
+			framework.Logf("[clb-wait] healthy=%d unhealthy=%d initial=%d total=%d | %s",
+				snap.HealthyCount, snap.UnhealthyCount, snap.InitialCount, total,
+				strings.Join(details, ", "))
+		}
+		if allHealthy {
+			framework.Logf("[clb-wait] all %d instances healthy", snap.HealthyCount)
+		}
+		return allHealthy, nil
+	})
+	framework.ExpectNoError(err, "all CLB instances healthy")
+	setupTimes.T3 = time.Now()
+
+	// Deploy in-cluster client
+	By("deploying in-cluster client on worker node")
+	clientPodName = deployInClusterClient(ctx, cs, ns.Name, image, lbDNS, aggregatorURL)
+
+	return lbDNS, clbObserver, cfg, setupTimes, clientPodName
+}
+
+// buildHealthTransitionServiceCLB creates a Service for a Classic Load Balancer.
+// CLB is the default when no aws-load-balancer-type annotation is set.
+// HC annotations are set to match the NLB test for fair comparison:
+// HTTP /readyz on port 19443, interval=10s, threshold=2/2.
+func buildHealthTransitionServiceCLB(namespace, name, deployName string) *v1.Service {
+	return &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Annotations: map[string]string{
+				// NO aws-load-balancer-type annotation = CLB (default)
+				"service.beta.kubernetes.io/aws-load-balancer-target-node-labels":              "node-role.kubernetes.io/control-plane=",
+				"service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled": "true",
+				"service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol":            "HTTP",
+				"service.beta.kubernetes.io/aws-load-balancer-healthcheck-path":                "/readyz",
+				"service.beta.kubernetes.io/aws-load-balancer-healthcheck-port":                fmt.Sprintf("%d", healthserverPort),
+				"service.beta.kubernetes.io/aws-load-balancer-healthcheck-interval":            "10",
+				"service.beta.kubernetes.io/aws-load-balancer-healthcheck-healthy-threshold":   "2",
+				// CLB default unhealthy threshold is 6 — set to 2 for fair comparison with NLB
+				"service.beta.kubernetes.io/aws-load-balancer-healthcheck-unhealthy-threshold": "2",
+			},
+		},
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyLocal,
+			Selector:              map[string]string{"app": deployName},
+			Ports: []v1.ServicePort{{
+				Name:       "http",
+				Protocol:   v1.ProtocolTCP,
+				Port:       int32(healthserverPort),
+				TargetPort: intstr.FromInt(healthserverPort),
+			}},
+		},
+	}
+}
+
+// waitForCLBUnhealthy blocks until at least one CLB instance reports OutOfService.
+func waitForCLBUnhealthy(ctx context.Context, observer *health.CLBObserver, timeout time.Duration) {
+	_ = wait.PollUntilContextTimeout(ctx, 2*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+		snap, err := observer.PollOnce(ctx)
+		if err != nil {
+			return false, nil
+		}
+		if snap.UnhealthyCount > 0 {
+			framework.Logf("[clb-wait] detected %d unhealthy instance(s)", snap.UnhealthyCount)
+			return true, nil
+		}
+		return false, nil
+	})
+}
+
+// startCLBSnapshotPusher pushes CLB health snapshots to the aggregator every 2s.
+func startCLBSnapshotPusher(ctx context.Context, cs clientset.Interface, namespace string, observer *health.CLBObserver) context.CancelFunc {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				snap, err := observer.PollOnce(ctx)
+				if err != nil {
+					continue
+				}
+				pushTGSnapshotToAggregator(ctx, cs, namespace, snap)
+			}
+		}
+	}()
+	return cancel
 }
 
 func ptrBool(b bool) *bool    { return &b }

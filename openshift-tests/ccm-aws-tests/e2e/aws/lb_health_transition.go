@@ -67,6 +67,11 @@ const (
 	// become healthy (both initial setup and post-restart). 90s gives enough
 	// time to confirm stable routing while keeping test duration reasonable.
 	postHealthyObserve = 90 * time.Second
+
+	// shutdownDrainObserve is how long we wait after TG detects unhealthy
+	// before triggering in-place container restart (ctl). Allows NLB to finish
+	// routing to the draining target (t7) before TCP goes down briefly.
+	shutdownDrainObserve = 90 * time.Second
 )
 
 // transitionTimeline captures all timing milestones from the SPLAT-307 state
@@ -2232,6 +2237,463 @@ var _ = Describe(healthTransitionTestPrefix, func() {
 			framework.Logf("\n%s", report)
 		})
 	})
+
+	// ── Scenario 5.5-SDK-multi-kas-ctl ───────────────────────────────────
+	// Same as 5.5-SDK-multi-kas but triggers shutdown via ctl exec (SIGUSR1)
+	// on a named pod, then in-place container restart (SIGUSR2) — no pod delete.
+	// TCP reopens in seconds on the same NLB target during NLB propagation window.
+	Context("SDK-managed NLB pre-readyz routing, multi-client KAS-config ctl restart (OCPBUGS-86789)", func() {
+		It("should not route to pre-readyz targets "+
+			"with ctl-driven shutdown and in-place container restart on a single backend", func(ctx context.Context) {
+
+			image := os.Getenv(envHealthserverImage)
+			if image == "" {
+				Skip(fmt.Sprintf("%s not set", envHealthserverImage))
+			}
+
+			var replicas int32
+			startupDelay := 60 * time.Second
+			shutdownDelay := kasShutdownDelay
+			deployName := "healthserver"
+			clientDSName := "healthtest-client"
+
+			var sdkNLB *SDKManagedNLB
+			var sgRuleID string
+			var masterSGID string
+			DeferCleanup(func(cleanupCtx context.Context) {
+				framework.Logf("cleaning up SDK-multi-kas-ctl test resources")
+				if sdkNLB != nil {
+					elbC, err := createAWSClientLoadBalancer(cleanupCtx)
+					if err == nil {
+						ec2C, ec2Err := createAWSClientEC2(cleanupCtx)
+						if ec2Err != nil {
+							framework.Logf("WARNING: failed to create EC2 client for NLB cleanup: %v", ec2Err)
+						}
+						deleteSDKManagedNLB(cleanupCtx, elbC, ec2C, sdkNLB)
+					}
+				}
+				if sgRuleID != "" && masterSGID != "" {
+					ec2C, err := createAWSClientEC2(cleanupCtx)
+					if err == nil {
+						removeSGIngressRule(cleanupCtx, ec2C, masterSGID, sgRuleID)
+					}
+				}
+				_ = cs.AppsV1().DaemonSets(ns.Name).Delete(cleanupCtx, deployName, metav1.DeleteOptions{})
+				_ = cs.AppsV1().DaemonSets(ns.Name).Delete(cleanupCtx, clientDSName, metav1.DeleteOptions{})
+				_ = cs.CoreV1().Pods(ns.Name).Delete(cleanupCtx, "healthtest-aggregator", metav1.DeleteOptions{})
+				_ = cs.CoreV1().Services(ns.Name).Delete(cleanupCtx, "healthtest-aggregator", metav1.DeleteOptions{})
+			})
+
+			By("deploying aggregator pod + service on worker node")
+			aggregatorURL := deployAggregator(ctx, cs, ns.Name, image)
+
+			By("granting privileged SCC to default service account")
+			grantHostNetworkSCC(ctx, cs, ns.Name)
+
+			By("creating healthserver DaemonSet (scheduled on master nodes, hostNetwork)")
+			ds := buildHealthserverDaemonSet(ns.Name, deployName, startupDelay, image, aggregatorURL)
+			var setupTimes transitionTimeline
+			setupTimes.T0 = time.Now()
+			_, err := cs.AppsV1().DaemonSets(ns.Name).Create(ctx, ds, metav1.CreateOptions{})
+			framework.ExpectNoError(err, "create daemonset")
+
+			By("waiting for DaemonSet rollout")
+			replicas, err = waitForDaemonSetReady(ctx, cs, ns.Name, deployName, 5*time.Minute)
+			framework.ExpectNoError(err, "daemonset rollout")
+			setupTimes.T1 = time.Now()
+
+			By("discovering cluster infrastructure (VPC, subnets, master instances, SG)")
+			ec2Client, err := createAWSClientEC2(ctx)
+			framework.ExpectNoError(err, "create EC2 client")
+			elbClient, err := createAWSClientLoadBalancer(ctx)
+			framework.ExpectNoError(err, "create ELB client")
+
+			infra, err := discoverClusterInfra(ctx, cs, ec2Client)
+			framework.ExpectNoError(err, "discover cluster infrastructure")
+
+			By(fmt.Sprintf("adding SG inbound rule for TCP %d on master SG %s", healthserverPort, infra.MasterSGID))
+			masterSGID = infra.MasterSGID
+			sgRuleID, err = addSGIngressRule(ctx, ec2Client, infra.MasterSGID, int32(healthserverPort))
+			framework.ExpectNoError(err, "add SG inbound rule")
+
+			By("creating SDK-managed NLB with instance:19443 targets")
+			sdkNLB, err = createSDKManagedNLB(ctx, elbClient, ec2Client, infra, int32(healthserverPort))
+			framework.ExpectNoError(err, "create SDK-managed NLB")
+			sdkNLB.SGID = masterSGID
+			sdkNLB.SGRuleID = sgRuleID
+			setupTimes.T2 = time.Now()
+
+			By("applying KAS-equivalent TG attributes (conn_term=false, draining=300s, preserve_client_ip=false)")
+			err = setTGKASAttributes(ctx, elbClient, sdkNLB.TGARN, false)
+			framework.ExpectNoError(err, "set KAS TG attributes")
+
+			observer := health.NewObserver(elbClient, 1*time.Second)
+			err = observer.DiscoverTargetGroup(ctx, sdkNLB.NLBARN)
+			framework.ExpectNoError(err, "discover target group")
+
+			By("waiting for ALL SDK NLB targets to become healthy")
+			err = waitForAllTGTargetsHealthy(ctx, observer, 10*time.Minute)
+			framework.ExpectNoError(err, "all SDK NLB targets healthy")
+			setupTimes.T3 = time.Now()
+
+			By("deploying client DaemonSet on worker nodes (one pod per worker)")
+			clientPodNames := deployClientDaemonSet(ctx, cs, ns.Name, image, sdkNLB.NLBDNS, aggregatorURL,
+				defaultClientWorkers, defaultClientInterval)
+
+			svcCfg := serviceConfig{
+				LBDNS:        sdkNLB.NLBDNS,
+				LBARN:        sdkNLB.NLBARN,
+				TGARN:        observer.TargetGroupARN(),
+				TGTargetType: observer.TargetType(),
+				Platform:     "AWS",
+				ServiceAnnotations: map[string]string{
+					"sdk-managed":              "true",
+					"client-mode":              "multi-client-daemonset",
+					"restart-mode":             "ctl-in-place",
+					"preserve_client_ip":       "false",
+					"connection_termination":   "false",
+					"draining_interval":        "300",
+					"target-port":              fmt.Sprintf("%d", healthserverPort),
+					"traffic-port":             fmt.Sprintf("%d", healthserverPort),
+					"hc-port":                  fmt.Sprintf("%d", healthserverPort),
+					"same-port-traffic-and-hc": "true",
+				},
+			}
+			if region, rErr := common.GetRegionFromInfrastructure(ctx); rErr == nil {
+				svcCfg.Region = region
+			}
+			if isExternal, tErr := common.IsExternalTopology(ctx); tErr == nil {
+				if isExternal {
+					svcCfg.Topology = "External (HyperShift)"
+				} else {
+					svcCfg.Topology = "HighlyAvailable"
+				}
+			}
+			tgAttrs, err := observer.DescribeTGAttributes(ctx)
+			if err == nil {
+				svcCfg.TGAttributes = tgAttrs
+			}
+			fetchTGHealthCheckConfig(ctx, &svcCfg)
+
+			observer.Start(ctx)
+			stopTGPush := startTGSnapshotPusher(ctx, cs, ns.Name, observer)
+			defer func() { stopTGPush(); observer.Stop() }()
+
+			By(fmt.Sprintf("verifying steady state for %s", postHealthyObserve))
+			time.Sleep(postHealthyObserve)
+
+			steadyRecords := fetchMergedClientRecords(ctx, cs, ns.Name, clientPodNames)
+			steadyNonReady := 0
+			for _, r := range steadyRecords {
+				if r.IsNonReadyReq {
+					steadyNonReady++
+				}
+			}
+			Expect(steadyNonReady).To(Equal(0), "pre-readyz responses during steady state")
+
+			By("listing pods to identify target for rollout simulation")
+			pods, err := cs.CoreV1().Pods(ns.Name).List(ctx, metav1.ListOptions{
+				LabelSelector: fmt.Sprintf("app=%s", deployName),
+			})
+			framework.ExpectNoError(err, "list healthserver pods")
+			Expect(len(pods.Items)).To(BeNumerically(">=", int(replicas)))
+
+			knownServers := make(map[string]bool)
+			podNodeMap := make(map[string]string)
+			for _, p := range pods.Items {
+				knownServers[p.Name] = true
+				podNodeMap[p.Name] = p.Spec.NodeName
+			}
+			targetPod := pods.Items[0].Name
+			targetNode := pods.Items[0].Spec.NodeName
+
+			restartBaseline, err := getContainerRestartCount(ctx, f, ns.Name, targetPod)
+			framework.ExpectNoError(err, "read baseline container restart count")
+
+			By("signaling target via ctl readyz-false (t5 — SIGUSR1, single backend)")
+			t5 := time.Now()
+			err = execHealthserverCtl(ctx, f, ns.Name, targetPod, "readyz-false")
+			framework.ExpectNoError(err, "ctl readyz-false")
+
+			By("waiting for TG to detect unhealthy target")
+			waitForTGUnhealthy(ctx, observer, 3*time.Minute)
+
+			By(fmt.Sprintf("observing shutdown drain for %s before in-place restart", shutdownDrainObserve))
+			time.Sleep(shutdownDrainObserve)
+
+			By("restarting healthserver in-place via ctl restart (t7.1 — SIGUSR2)")
+			t71 := time.Now()
+			err = execHealthserverCtl(ctx, f, ns.Name, targetPod, "restart")
+			framework.ExpectNoError(err, "ctl restart")
+
+			By("waiting for container restart")
+			err = waitForContainerRestart(ctx, f, ns.Name, targetPod, restartBaseline)
+			framework.ExpectNoError(err, "container restarted")
+
+			By("waiting for restarted target to become healthy")
+			err = waitForAllTGTargetsHealthy(ctx, observer, 10*time.Minute)
+			framework.ExpectNoError(err, "restarted target healthy")
+
+			By(fmt.Sprintf("observing post-recovery traffic for %s", postHealthyObserve))
+			time.Sleep(postHealthyObserve)
+
+			allRecords := fetchMergedClientRecords(ctx, cs, ns.Name, clientPodNames)
+			allEvents := observer.Events()
+
+			tl := computeTimeline(targetPod, knownServers, t5, t71, allRecords, allEvents, true)
+			tl.T0 = setupTimes.T0
+			tl.T1 = setupTimes.T1
+			tl.T2 = setupTimes.T2
+			tl.T3 = setupTimes.T3
+			for _, r := range steadyRecords {
+				if r.Error == "" && r.HTTPStatus > 0 {
+					tl.T4 = r.Timestamp
+					break
+				}
+			}
+			tl.TargetPod = targetPod
+			tl.TargetNode = targetNode
+			tl.NewPod = targetPod
+
+			report := buildReport("5.5-SDK-multi-kas-ctl (Multi-Client + KAS TG + ctl in-place restart / OCPBUGS-86789)",
+				tl, svcCfg, replicas, startupDelay, shutdownDelay,
+				allRecords, allEvents, observer.Snapshots())
+			report += buildVerdict55(tl, allRecords)
+			framework.Logf("\n%s", report)
+		})
+	})
+
+	// ── Scenario 5.5-SDK-multi-kas-tls-ctl ───────────────────────────────
+	// Most faithful KAS repro: KAS TG attributes + TLS/HTTPS HC + ctl in-place
+	// restart (v22 TLS + v23 ctl). Combines real KAS traffic path with realistic
+	// restart timing on the same instance:port NLB target.
+	Context("SDK-managed NLB pre-readyz routing, multi-client KAS-config TLS ctl restart (OCPBUGS-86789)", func() {
+		It("should not route to pre-readyz targets "+
+			"with KAS TG attributes, TLS traffic, HTTPS HC, and ctl-driven in-place container restart", func(ctx context.Context) {
+
+			image := os.Getenv(envHealthserverImage)
+			if image == "" {
+				Skip(fmt.Sprintf("%s not set", envHealthserverImage))
+			}
+
+			var replicas int32
+			startupDelay := 60 * time.Second
+			shutdownDelay := kasShutdownDelay
+			deployName := "healthserver"
+			clientDSName := "healthtest-client"
+
+			var sdkNLB *SDKManagedNLB
+			var sgRuleID string
+			var masterSGID string
+			DeferCleanup(func(cleanupCtx context.Context) {
+				framework.Logf("cleaning up SDK-multi-kas-tls-ctl test resources")
+				if sdkNLB != nil {
+					elbC, err := createAWSClientLoadBalancer(cleanupCtx)
+					if err == nil {
+						ec2C, ec2Err := createAWSClientEC2(cleanupCtx)
+						if ec2Err != nil {
+							framework.Logf("WARNING: failed to create EC2 client for NLB cleanup: %v", ec2Err)
+						}
+						deleteSDKManagedNLB(cleanupCtx, elbC, ec2C, sdkNLB)
+					}
+				}
+				if sgRuleID != "" && masterSGID != "" {
+					ec2C, err := createAWSClientEC2(cleanupCtx)
+					if err == nil {
+						removeSGIngressRule(cleanupCtx, ec2C, masterSGID, sgRuleID)
+					}
+				}
+				_ = cs.AppsV1().DaemonSets(ns.Name).Delete(cleanupCtx, deployName, metav1.DeleteOptions{})
+				_ = cs.AppsV1().DaemonSets(ns.Name).Delete(cleanupCtx, clientDSName, metav1.DeleteOptions{})
+				_ = cs.CoreV1().Pods(ns.Name).Delete(cleanupCtx, "healthtest-aggregator", metav1.DeleteOptions{})
+				_ = cs.CoreV1().Services(ns.Name).Delete(cleanupCtx, "healthtest-aggregator", metav1.DeleteOptions{})
+				_ = cs.CoreV1().ConfigMaps(ns.Name).Delete(cleanupCtx, healthserverTLSConfigMap, metav1.DeleteOptions{})
+			})
+
+			By("deploying aggregator pod + service on worker node")
+			aggregatorURL := deployAggregator(ctx, cs, ns.Name, image)
+
+			By("granting privileged SCC to default service account")
+			grantHostNetworkSCC(ctx, cs, ns.Name)
+
+			By("creating TLS cert ConfigMap for healthserver")
+			err := ensureHealthserverTLSConfigMap(ctx, cs, ns.Name)
+			framework.ExpectNoError(err, "create TLS configmap")
+
+			By("creating healthserver DaemonSet with TLS (scheduled on master nodes, hostNetwork)")
+			ds := buildHealthserverDaemonSetTLS(ns.Name, deployName, startupDelay, image, aggregatorURL)
+			var setupTimes transitionTimeline
+			setupTimes.T0 = time.Now()
+			_, err = cs.AppsV1().DaemonSets(ns.Name).Create(ctx, ds, metav1.CreateOptions{})
+			framework.ExpectNoError(err, "create daemonset")
+
+			By("waiting for DaemonSet rollout")
+			replicas, err = waitForDaemonSetReady(ctx, cs, ns.Name, deployName, 5*time.Minute)
+			framework.ExpectNoError(err, "daemonset rollout")
+			setupTimes.T1 = time.Now()
+
+			By("discovering cluster infrastructure (VPC, subnets, master instances, SG)")
+			ec2Client, err := createAWSClientEC2(ctx)
+			framework.ExpectNoError(err, "create EC2 client")
+			elbClient, err := createAWSClientLoadBalancer(ctx)
+			framework.ExpectNoError(err, "create ELB client")
+
+			infra, err := discoverClusterInfra(ctx, cs, ec2Client)
+			framework.ExpectNoError(err, "discover cluster infrastructure")
+
+			By(fmt.Sprintf("adding SG inbound rule for TCP %d on master SG %s", healthserverPort, infra.MasterSGID))
+			masterSGID = infra.MasterSGID
+			sgRuleID, err = addSGIngressRule(ctx, ec2Client, infra.MasterSGID, int32(healthserverPort))
+			framework.ExpectNoError(err, "add SG inbound rule")
+
+			By("creating SDK-managed NLB with instance:19443 targets and HTTPS HC")
+			sdkNLB, err = createSDKManagedNLB(ctx, elbClient, ec2Client, infra, int32(healthserverPort), SDKNLBCreateOpts{
+				HealthCheckProtocol: elbv2types.ProtocolEnumHttps,
+			})
+			framework.ExpectNoError(err, "create SDK-managed NLB")
+			sdkNLB.SGID = masterSGID
+			sdkNLB.SGRuleID = sgRuleID
+			setupTimes.T2 = time.Now()
+
+			By("applying KAS-equivalent TG attributes (conn_term=false, draining=300s, preserve_client_ip=false)")
+			err = setTGKASAttributes(ctx, elbClient, sdkNLB.TGARN, false)
+			framework.ExpectNoError(err, "set KAS TG attributes")
+
+			observer := health.NewObserver(elbClient, 1*time.Second)
+			err = observer.DiscoverTargetGroup(ctx, sdkNLB.NLBARN)
+			framework.ExpectNoError(err, "discover target group")
+
+			By("waiting for ALL SDK NLB targets to become healthy")
+			err = waitForAllTGTargetsHealthy(ctx, observer, 10*time.Minute)
+			framework.ExpectNoError(err, "all SDK NLB targets healthy")
+			setupTimes.T3 = time.Now()
+
+			By("deploying client DaemonSet on worker nodes (TLS to NLB, one pod per worker)")
+			clientPodNames := deployClientDaemonSet(ctx, cs, ns.Name, image, sdkNLB.NLBDNS, aggregatorURL,
+				defaultClientWorkers, defaultClientInterval, true)
+
+			svcCfg := serviceConfig{
+				LBDNS:        sdkNLB.NLBDNS,
+				LBARN:        sdkNLB.NLBARN,
+				TGARN:        observer.TargetGroupARN(),
+				TGTargetType: observer.TargetType(),
+				Platform:     "AWS",
+				ServiceAnnotations: map[string]string{
+					"sdk-managed":              "true",
+					"client-mode":              "multi-client-daemonset",
+					"restart-mode":             "ctl-in-place",
+					"preserve_client_ip":       "false",
+					"connection_termination":   "false",
+					"draining_interval":        "300",
+					"tls":                      "true",
+					"hc-protocol":              "HTTPS",
+					"target-port":              fmt.Sprintf("%d", healthserverPort),
+					"traffic-port":             fmt.Sprintf("%d", healthserverPort),
+					"hc-port":                  fmt.Sprintf("%d", healthserverPort),
+					"same-port-traffic-and-hc": "true",
+				},
+			}
+			if region, rErr := common.GetRegionFromInfrastructure(ctx); rErr == nil {
+				svcCfg.Region = region
+			}
+			if isExternal, tErr := common.IsExternalTopology(ctx); tErr == nil {
+				if isExternal {
+					svcCfg.Topology = "External (HyperShift)"
+				} else {
+					svcCfg.Topology = "HighlyAvailable"
+				}
+			}
+			tgAttrs, err := observer.DescribeTGAttributes(ctx)
+			if err == nil {
+				svcCfg.TGAttributes = tgAttrs
+			}
+			fetchTGHealthCheckConfig(ctx, &svcCfg)
+
+			observer.Start(ctx)
+			stopTGPush := startTGSnapshotPusher(ctx, cs, ns.Name, observer)
+			defer func() { stopTGPush(); observer.Stop() }()
+
+			By(fmt.Sprintf("verifying steady state for %s", postHealthyObserve))
+			time.Sleep(postHealthyObserve)
+
+			steadyRecords := fetchMergedClientRecords(ctx, cs, ns.Name, clientPodNames)
+			steadyNonReady := 0
+			for _, r := range steadyRecords {
+				if r.IsNonReadyReq {
+					steadyNonReady++
+				}
+			}
+			Expect(steadyNonReady).To(Equal(0), "pre-readyz responses during steady state")
+
+			By("listing pods to identify target for rollout simulation")
+			pods, err := cs.CoreV1().Pods(ns.Name).List(ctx, metav1.ListOptions{
+				LabelSelector: fmt.Sprintf("app=%s", deployName),
+			})
+			framework.ExpectNoError(err, "list healthserver pods")
+			Expect(len(pods.Items)).To(BeNumerically(">=", int(replicas)))
+
+			knownServers := make(map[string]bool)
+			for _, p := range pods.Items {
+				knownServers[p.Name] = true
+			}
+			targetPod := pods.Items[0].Name
+			targetNode := pods.Items[0].Spec.NodeName
+
+			restartBaseline, err := getContainerRestartCount(ctx, f, ns.Name, targetPod)
+			framework.ExpectNoError(err, "read baseline container restart count")
+
+			By("signaling target via ctl readyz-false (t5 — SIGUSR1, single backend)")
+			t5 := time.Now()
+			err = execHealthserverCtl(ctx, f, ns.Name, targetPod, "readyz-false")
+			framework.ExpectNoError(err, "ctl readyz-false")
+
+			By("waiting for TG to detect unhealthy target")
+			waitForTGUnhealthy(ctx, observer, 3*time.Minute)
+
+			By(fmt.Sprintf("observing shutdown drain for %s before in-place restart", shutdownDrainObserve))
+			time.Sleep(shutdownDrainObserve)
+
+			By("restarting healthserver in-place via ctl restart (t7.1 — SIGUSR2)")
+			t71 := time.Now()
+			err = execHealthserverCtl(ctx, f, ns.Name, targetPod, "restart")
+			framework.ExpectNoError(err, "ctl restart")
+
+			By("waiting for container restart")
+			err = waitForContainerRestart(ctx, f, ns.Name, targetPod, restartBaseline)
+			framework.ExpectNoError(err, "container restarted")
+
+			By("waiting for restarted target to become healthy")
+			err = waitForAllTGTargetsHealthy(ctx, observer, 10*time.Minute)
+			framework.ExpectNoError(err, "restarted target healthy")
+
+			By(fmt.Sprintf("observing post-recovery traffic for %s", postHealthyObserve))
+			time.Sleep(postHealthyObserve)
+
+			allRecords := fetchMergedClientRecords(ctx, cs, ns.Name, clientPodNames)
+			allEvents := observer.Events()
+
+			tl := computeTimeline(targetPod, knownServers, t5, t71, allRecords, allEvents, true)
+			tl.T0 = setupTimes.T0
+			tl.T1 = setupTimes.T1
+			tl.T2 = setupTimes.T2
+			tl.T3 = setupTimes.T3
+			for _, r := range steadyRecords {
+				if r.Error == "" && r.HTTPStatus > 0 {
+					tl.T4 = r.Timestamp
+					break
+				}
+			}
+			tl.TargetPod = targetPod
+			tl.TargetNode = targetNode
+			tl.NewPod = targetPod
+
+			report := buildReport("5.5-SDK-multi-kas-tls-ctl (Multi-Client + KAS TG + TLS + ctl in-place restart / OCPBUGS-86789)",
+				tl, svcCfg, replicas, startupDelay, shutdownDelay,
+				allRecords, allEvents, observer.Snapshots())
+			report += buildVerdict55(tl, allRecords)
+			framework.Logf("\n%s", report)
+		})
+	})
 })
 
 // ─── Setup helper ───────────────────────────────────────────────────────────
@@ -2566,16 +3028,43 @@ func isUnhealthyState(state string) bool {
 	return strings.HasPrefix(state, "unhealthy")
 }
 
+func parseServerStartTime(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		t, err = time.Parse(time.RFC3339, raw)
+	}
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t.UTC(), true
+}
+
+func isRestartProcess(r health.RequestRecord, restartAt time.Time) bool {
+	start, ok := parseServerStartTime(r.ServerStartTime)
+	if !ok {
+		return r.Timestamp.After(restartAt)
+	}
+	return start.After(restartAt) || start.Equal(restartAt)
+}
+
 // computeTimeline builds the full timing model for Scenario 5.5 from raw
 // client records and observer events. See transitionTimeline for the t-value
 // definitions aligned with the SPLAT-307 state machine.
+//
+// Pass inPlaceRestart=true when the target pod is restarted in-place via
+// ctl (same ServerID/POD_NAME); t71 must be the ctl restart time, after t5.
 func computeTimeline(
 	oldPod string,
 	knownServers map[string]bool,
 	t5, t71 time.Time,
 	records []health.RequestRecord,
 	events []health.HealthEvent,
+	inPlaceRestart ...bool,
 ) transitionTimeline {
+	inPlace := len(inPlaceRestart) > 0 && inPlaceRestart[0]
 	tl := transitionTimeline{T5: t5, T71: t71}
 
 	// t6: first observer event showing a target transitioning healthy→unhealthy
@@ -2591,11 +3080,18 @@ func computeTimeline(
 		}
 	}
 
-	// t7: last request served by the OLD target pod after t5.
+	// t7: last request served by the target during graceful shutdown (t5→t71).
 	// Each request after readyz→503 counts as an "unhealthy" request.
+	shutdownEnd := time.Time{}
+	if inPlace && t71.After(t5) {
+		shutdownEnd = t71
+	}
 	lateThreshold := t5.Add(time.Duration(float64(kasShutdownDelay) * 0.8))
 	for _, r := range records {
 		if r.Timestamp.Before(t5) {
+			continue
+		}
+		if !shutdownEnd.IsZero() && !r.Timestamp.Before(shutdownEnd) {
 			continue
 		}
 		if r.ServerID == oldPod {
@@ -2607,46 +3103,69 @@ func computeTimeline(
 		}
 	}
 
-	// Identify the new pod: first ServerID not in knownServers, after t7.1
-	for _, r := range records {
-		if r.ServerID == "" || knownServers[r.ServerID] || r.Timestamp.Before(t71) {
-			continue
-		}
-		tl.NewPod = r.ServerID
-		break
-	}
-
-	// Now process only responses from the identified new pod
-	for _, r := range records {
-		if r.ServerID != tl.NewPod || r.Timestamp.Before(t71) {
-			continue
-		}
-
-		// t7.3: first response from new pod (approximates TCP up)
-		if tl.T73.IsZero() {
-			tl.T73 = r.Timestamp
-		}
-
-		// t7.4: first pre-readyz request from new pod
-		if r.IsNonReadyReq {
-			tl.PreReadyzReqCount++
-			if tl.T74.IsZero() {
-				tl.T74 = r.Timestamp
+	if inPlace {
+		tl.NewPod = oldPod
+		for _, r := range records {
+			if r.ServerID != oldPod || !isRestartProcess(r, t71) {
+				continue
+			}
+			if start, ok := parseServerStartTime(r.ServerStartTime); ok {
+				if tl.T73.IsZero() || start.Before(tl.T73) {
+					tl.T73 = start
+				}
+			} else if tl.T73.IsZero() {
+				tl.T73 = r.Timestamp
+			}
+			if r.IsNonReadyReq {
+				tl.PreReadyzReqCount++
+				if tl.T74.IsZero() {
+					tl.T74 = r.Timestamp
+				}
+			}
+			if tl.T8.IsZero() && r.ServerState == "ready" && r.FirstReadyzTime != "never" && r.FirstReadyzTime != "" {
+				if parsed, err := time.Parse(time.RFC3339Nano, r.FirstReadyzTime); err == nil {
+					tl.T8 = parsed.UTC()
+				}
+			}
+			if tl.T10.IsZero() && r.ServerState == "ready" {
+				tl.T10 = r.Timestamp
 			}
 		}
-
-		// t8: when the new pod's /readyz first returned 200 (from header, local time).
-		// The healthserver runs in UTC inside the container; we convert to local
-		// time to match the test's clock for consistent delta calculations.
-		if tl.T8.IsZero() && r.ServerState == "ready" && r.FirstReadyzTime != "never" && r.FirstReadyzTime != "" {
-			if parsed, err := time.Parse(time.RFC3339Nano, r.FirstReadyzTime); err == nil {
-				tl.T8 = parsed.UTC()
+	} else {
+		// Identify the new pod: first ServerID not in knownServers, after t7.1
+		for _, r := range records {
+			if r.ServerID == "" || knownServers[r.ServerID] || r.Timestamp.Before(t71) {
+				continue
 			}
+			tl.NewPod = r.ServerID
+			break
 		}
 
-		// t10: first client request where new pod reports "ready"
-		if tl.T10.IsZero() && r.ServerState == "ready" {
-			tl.T10 = r.Timestamp
+		for _, r := range records {
+			if r.ServerID != tl.NewPod || r.Timestamp.Before(t71) {
+				continue
+			}
+			if start, ok := parseServerStartTime(r.ServerStartTime); ok {
+				if tl.T73.IsZero() || start.Before(tl.T73) {
+					tl.T73 = start
+				}
+			} else if tl.T73.IsZero() {
+				tl.T73 = r.Timestamp
+			}
+			if r.IsNonReadyReq {
+				tl.PreReadyzReqCount++
+				if tl.T74.IsZero() {
+					tl.T74 = r.Timestamp
+				}
+			}
+			if tl.T8.IsZero() && r.ServerState == "ready" && r.FirstReadyzTime != "never" && r.FirstReadyzTime != "" {
+				if parsed, err := time.Parse(time.RFC3339Nano, r.FirstReadyzTime); err == nil {
+					tl.T8 = parsed.UTC()
+				}
+			}
+			if tl.T10.IsZero() && r.ServerState == "ready" {
+				tl.T10 = r.Timestamp
+			}
 		}
 	}
 
@@ -2847,7 +3366,13 @@ func buildReport(
 	w("%-25s %-14d %-14s %s", "Unhealthy_reqs", tl.UnhealthyReqCount, "0 ideal", "requests to target after readyz→503")
 	w("%-25s %-14d %-14s %s", "Late_conn_reqs", tl.LateConnectionCount, "0 ideal", "requests after 80% shutdown delay")
 	if !tl.T71.IsZero() {
-		w("%-25s %-14s %-14s %s", "T_pod_restart", fmtDur(tl.T71, tl.T73), "seconds", "t7.3-t7.1: pod kill→TCP up")
+		restartMetric := "T_pod_restart"
+		restartDesc := "t7.3-t7.1: pod kill→TCP up"
+		if cfg.ServiceAnnotations["restart-mode"] == "ctl-in-place" {
+			restartMetric = "T_container_restart"
+			restartDesc = "t7.3-t7.1: ctl SIGUSR2→TCP up (same pod)"
+		}
+		w("%-25s %-14s %-14s %s", restartMetric, fmtDur(tl.T71, tl.T73), "seconds", restartDesc)
 		w("%-25s %-14d %-14s %s", "Pre_readyz_reqs", tl.PreReadyzReqCount, "0", "requests before readyz→200 (BUG)")
 	}
 	w("%-25s %-14s %-14s %s", "T_tg_healthy", fmtDur(tl.T8, tl.T9), "~20s", "t9-t8: HC detect healthy")
@@ -3098,8 +3623,12 @@ func buildReport(
 	addEntry(tl.T5, "t5  readyz→503", "")
 	addEntry(tl.T6, "t6  TG unhealthy", fmtDelta(tl.T5, tl.T6))
 	addEntry(tl.T7, "t7  last routed req", fmtDelta(tl.T5, tl.T7))
-	addEntry(tl.T71, "t7.1 pod deleted (SIGTERM sent)", fmtDelta(tl.T5, tl.T71))
-	addEntry(tl.T73, "t7.3 new TCP up", fmtDelta(tl.T71, tl.T73))
+	t71Label := "t7.1 pod deleted (SIGTERM sent)"
+	if cfg.ServiceAnnotations["restart-mode"] == "ctl-in-place" {
+		t71Label = "t7.1 ctl restart (SIGUSR2, container exit)"
+	}
+	addEntry(tl.T71, t71Label, fmtDelta(tl.T5, tl.T71))
+	addEntry(tl.T73, "t7.3 TCP up", fmtDelta(tl.T71, tl.T73))
 	if !tl.T74.IsZero() {
 		addEntry(tl.T74, "t7.4 pre-readyz req ← BUG", fmtDelta(tl.T73, tl.T74))
 	}
@@ -3834,6 +4363,7 @@ func fetchClientRecords(ctx context.Context, cs clientset.Interface, namespace, 
 		HTTPStatus      int       `json:"http_status"`
 		ServerState     string    `json:"server_state"`
 		ServerID        string    `json:"server_id"`
+		ServerStartTime string    `json:"server_start_time"`
 		FirstReadyzTime string    `json:"first_readyz_time"`
 		IsNonReadyReq   bool      `json:"is_non_ready_req"`
 		Error           string    `json:"error,omitempty"`
@@ -3853,6 +4383,7 @@ func fetchClientRecords(ctx context.Context, cs clientset.Interface, namespace, 
 			HTTPStatus:      cr.HTTPStatus,
 			ServerState:     cr.ServerState,
 			ServerID:        cr.ServerID,
+			ServerStartTime: cr.ServerStartTime,
 			FirstReadyzTime: cr.FirstReadyzTime,
 			IsNonReadyReq:   cr.IsNonReadyReq,
 			Error:           cr.Error,

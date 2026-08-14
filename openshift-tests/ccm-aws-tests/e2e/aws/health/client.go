@@ -132,6 +132,7 @@ func (c *Client) doRequest(ctx context.Context) {
 	rec.HTTPStatus = resp.StatusCode
 	rec.ServerState = resp.Header.Get("X-Server-State")
 	rec.ServerID = resp.Header.Get("X-Server-ID")
+	rec.ServerStartTime = resp.Header.Get("X-Server-Start-Time")
 	rec.FirstReadyzTime = resp.Header.Get("X-First-Readyz-Time")
 	rec.IsNonReadyReq = rec.ServerState == "pre-readyz"
 

@@ -44,14 +44,32 @@ t5   readyz → 503  (SIGTERM sent / admin signal)
 t6   TG target transitions to UNHEALTHY  (~20 s after t5)
 t7   Last request routed to target after t5  (NLB drains connection)
 
-t7.1 Pod delete sent (SIGTERM delivered by kubelet)
-t7.3 New pod TCP port bound (from X-Server-Start-Time)
+t7.1 Restart trigger — **depends on restart engine** (see below)
+t7.3 Target TCP port bound again (from `X-Server-Start-Time`)
 t7.4 First pre-readyz request  (BUG if present)
 
 t8   readyz → 200  (new pod ready)
 t9   TG target transitions to HEALTHY  (~20 s after t8)
 t10  First request routed to new pod
 ```
+
+### Restart engines (SDK scenarios)
+
+Two ways to simulate KAS restart after graceful shutdown. **Only one scenario uses ctl
+today**; all other SDK tests still use pod delete.
+
+| Engine | t5 signal | t7.1 action | t7.1 → t7.3 gap | NLB target identity | Used by |
+|--------|-----------|-------------|-----------------|---------------------|---------|
+| **pod delete** | admin proxy or implicit via delete | `kubectl delete pod` | **~2–3 min** (DaemonSet replacement) | New pod name | 5.5-SDK … 5.5-SDK-multi-kas-tls |
+| **ctl in-place** | `kubectl exec` → `ctl readyz-false` (SIGUSR1) | `ctl restart` (SIGUSR2) | **~1–2 s** (kubelet container restart) | Same pod / same instance:port | 5.5-SDK-multi-kas-ctl, **5.5-SDK-multi-kas-tls-ctl** |
+
+**Why ctl matters:** Pod delete closes the TCP port for minutes while the NLB target
+re-registers. Real KAS restarts on the same node in seconds — the pre-readyz routing
+window is visible only with ctl in-place restart. Case study: `5.5-SDK-multi-kas` (pod
+delete) reported `Pre_readyz_reqs=0`; `5.5-SDK-multi-kas-ctl` reported `Pre_readyz_reqs=204`
+on the same cluster (`nlb-case5.txt` vs `nlb-case9.1.txt`).
+
+**Plan:** `ai-plans/lb-health-transition-e2e-plan-v23-ctl-inplace-restart.md`
 
 ---
 
@@ -365,28 +383,116 @@ $BIN run-test "...multi-client KAS-config TLS..."
 
 ---
 
+## Scenario 5.5-SDK-multi-kas-ctl — Multi-Client, KAS TG Config + ctl In-Place Restart
+
+**Report label:** `5.5-SDK-multi-kas-ctl (Multi-Client + KAS TG Config + ctl in-place restart / OCPBUGS-86789)`
+
+**Ginkgo:** `SDK-managed NLB pre-readyz routing, multi-client KAS-config ctl restart (OCPBUGS-86789)`
+
+Same TG attributes as **5.5-SDK-multi-kas**, but simulates KAS restart more faithfully:
+
+| Step | Action |
+|------|--------|
+| t5 | `kubectl exec` → `/e2e-nlb-health-test ctl readyz-false` (SIGUSR1 → `/readyz` 503, keep serving) |
+| t6 | TG detects unhealthy |
+| t7 | Observe shutdown drain (~90s) while NLB may still route to draining target |
+| t7.1 | `kubectl exec` → `/e2e-nlb-health-test ctl restart` (SIGUSR2 → exit; kubelet restarts container in seconds) |
+| t7.3 | TCP up from `X-Server-Start-Time` (same pod name / NLB target) |
+| t8–t10 | `/readyz` → 200, TG healthy, client traffic |
+
+**Why not pod delete:** Deleting the DaemonSet pod creates a ~3 minute TCP gap (new pod on same node still needs NLB target propagation). Real KAS restarts on the same node in seconds — this variant closes that gap.
+
+| Parameter | Value |
+|-----------|-------|
+| Client | DaemonSet on workers, 16 workers × 50ms per pod |
+| Restart mode | **ctl in-place** (no pod delete) |
+| preserve_client_ip | false |
+| connection_termination | false |
+| draining_interval | 300s |
+| shutdown drain observe | 90s before ctl restart |
+
+**Run:**
+```bash
+$BIN run-test "...multi-client KAS-config ctl restart..."
+```
+
+**Code:** `lb_health_transition.go`, `ctl_exec.go`, `cmd/e2e-nlb-health-test/ctl.go`
+
+---
+
+## Scenario 5.5-SDK-multi-kas-tls-ctl — Multi-Client, KAS TG + TLS + ctl In-Place Restart
+
+**Report label:** `5.5-SDK-multi-kas-tls-ctl (Multi-Client + KAS TG + TLS + ctl in-place restart / OCPBUGS-86789)`
+
+**Ginkgo:** `SDK-managed NLB pre-readyz routing, multi-client KAS-config TLS ctl restart (OCPBUGS-86789)`
+
+**Most faithful KAS reproduction** — combines everything from the production path:
+
+| Layer | Config |
+|-------|--------|
+| NLB stack | AWS SDK, `instance:19443` (same as KAS) |
+| TG attributes | KAS-equivalent (`conn_term=false`, `draining=300s`, `preserve_client_ip=false`) |
+| Traffic | **TLS** on port 19443 (self-signed cert, `--tls-insecure` client) |
+| Health check | **HTTPS** `/readyz` on same port |
+| Client | DaemonSet on workers, 16 workers × 50ms per pod |
+| Restart | **ctl in-place** (SIGUSR1 shutdown → 90s drain → SIGUSR2 restart) |
+
+Same ctl flow as **5.5-SDK-multi-kas-ctl**, with TLS/HTTPS HC from **5.5-SDK-multi-kas-tls**.
+
+| Parameter | Value |
+|-----------|-------|
+| Client | DaemonSet on workers, 16 workers × 50ms per pod |
+| Restart mode | **ctl in-place** |
+| Traffic / HC | **TLS / HTTPS** |
+| preserve_client_ip | false |
+| connection_termination | false |
+| draining_interval | 300s |
+
+**Run:**
+```bash
+$BIN run-test "...multi-client KAS-config TLS ctl restart..." \
+  | tee ai-plans/nlb-test-cases/nlb-case10.1.txt
+```
+
+**Compare with:**
+```bash
+# HTTP ctl (v23)
+$BIN run-test "...KAS-config ctl restart..." | tee ai-plans/nlb-test-cases/nlb-case9.1.txt
+# TLS pod-delete (v22, conservative)
+$BIN run-test "...KAS-config TLS..." | tee ai-plans/nlb-test-cases/nlb-case7.1.txt
+```
+
+**Code:** `lb_health_transition.go`, `tls_certs.go`, `ctl_exec.go`, `cmd/e2e-nlb-health-test/ctl.go`
+
+**Plan:** `ai-plans/lb-health-transition-e2e-plan-v24-kas-tls-ctl.md`
+
+---
+
 ## SDK Variants — Comparison Matrix
 
 All SDK variants share: healthserver DaemonSet on masters, SDK-managed NLB, same
-HC config (HTTP `/readyz`, interval=10s, threshold=2), same rollout simulation
-(delete one pod, wait for same-node replacement).
+HC config (HTTP `/readyz`, interval=10s, threshold=2). They differ in **client
+topology**, **TG attributes**, **TLS**, and **restart engine** (see Restart engines
+above).
 
 ### Default TG attributes (5.5-SDK through 5.5-SDK-multi-no-cip)
 
-| Scenario | Client | preserve_client_ip | conn_term | draining | KAS-faithful |
-|----------|--------|-------------------|-----------|----------|--------------|
-| 5.5-SDK | 1 pod, 32w | true | true (default) | 0 (default) | NLB yes, clients no |
-| 5.5-SDK-no-cip | 1 pod, 32w | false | true (default) | 0 (default) | NLB no |
-| 5.5-SDK-multi | DS/worker, 16w | true | true (default) | 0 (default) | Clients yes, TG no |
-| 5.5-SDK-multi-no-cip | DS/worker, 16w | false | true (default) | 0 (default) | Clients yes, TG no |
+| Scenario | Client | preserve_client_ip | conn_term | draining | Restart |
+|----------|--------|-------------------|-----------|----------|---------|
+| 5.5-SDK | 1 pod, 32w | true | true (default) | 0 (default) | pod delete |
+| 5.5-SDK-no-cip | 1 pod, 32w | false | true (default) | 0 (default) | pod delete |
+| 5.5-SDK-multi | DS/worker, 16w | true | true (default) | 0 (default) | pod delete |
+| 5.5-SDK-multi-no-cip | DS/worker, 16w | false | true (default) | 0 (default) | pod delete |
 
-### Real KAS TG attributes (5.5-SDK-multi-kas, 5.5-SDK-multi-kas-cip, 5.5-SDK-multi-kas-tls)
+### Real KAS TG attributes (5.5-SDK-multi-kas family)
 
-| Scenario | Client | preserve_client_ip | conn_term | draining | TLS/HC | KAS-faithful |
-|----------|--------|-------------------|-----------|----------|--------|--------------|
-| 5.5-SDK-multi-kas | DS/worker, 16w | false | **false** | **300s** | HTTP/HTTP | **Yes (most faithful HTTP)** |
-| 5.5-SDK-multi-kas-cip | DS/worker, 16w | true | **false** | **300s** | HTTP/HTTP | CIP comparison |
-| 5.5-SDK-multi-kas-tls | DS/worker, 16w | false | **false** | **300s** | **TLS/HTTPS** | **Yes (TLS + HC)** |
+| Scenario | Client | preserve_client_ip | conn_term | draining | TLS/HC | Restart |
+|----------|--------|-------------------|-----------|----------|--------|---------|
+| 5.5-SDK-multi-kas | DS/worker, 16w | false | **false** | **300s** | HTTP/HTTP | pod delete |
+| 5.5-SDK-multi-kas-cip | DS/worker, 16w | true | **false** | **300s** | HTTP/HTTP | pod delete |
+| 5.5-SDK-multi-kas-tls | DS/worker, 16w | false | **false** | **300s** | **TLS/HTTPS** | pod delete |
+| 5.5-SDK-multi-kas-ctl | DS/worker, 16w | false | **false** | **300s** | HTTP/HTTP | **ctl in-place** |
+| **5.5-SDK-multi-kas-tls-ctl** | DS/worker, 16w | false | **false** | **300s** | **TLS/HTTPS** | **ctl in-place** |
 
 **Real KAS TG attributes** (from `aws elbv2 describe-target-group-attributes`):
 ```
@@ -401,7 +507,37 @@ stickiness.enabled                                          = false
 **Shared AWS lifecycle** (all SDK variants): see v19 plan (`sdk_nlb.go`).
 Cleanup includes SG retry on `DependencyViolation` and idempotent SG create on reruns.
 
-**Plan:** `ai-plans/lb-health-transition-e2e-plan-v21-multi-client.md`
+**Plans:** v21 (SDK matrix), v22 (TLS), **v23 (ctl in-place restart)**
+
+---
+
+## SDK Data Collection — Final Report
+
+Before filing or updating OCPBUGS-86789 evidence, collect all SDK variant runs on the
+**same cluster** and **same `HEALTHSERVER_IMAGE` build**. Save output under
+`ai-plans/nlb-test-cases/`.
+
+| Output file | Scenario | Restart engine | Run filter (substring) |
+|-------------|----------|----------------|------------------------|
+| `nlb-case4.txt` | 5.5-SDK | pod delete | `KAS-equivalent` |
+| `nlb-case1.txt` | 5.5-SDK-no-cip | pod delete | `preserve_client_ip=false` (not multi-client) |
+| `nlb-case3.txt` | 5.5-SDK-multi | pod delete | `multi-client (OCPBUGS` |
+| `nlb-case2.txt` | 5.5-SDK-multi-no-cip | pod delete | `multi-client preserve_client_ip=false` |
+| `nlb-case5.txt` | 5.5-SDK-multi-kas | pod delete | `multi-client KAS-config (OCPBUGS` |
+| `nlb-case6.txt` | 5.5-SDK-multi-kas-cip | pod delete | `KAS-config preserve_client_ip=true` |
+| `nlb-case7.1.txt` | 5.5-SDK-multi-kas-tls | pod delete | `KAS-config TLS` |
+| `nlb-case9.1.txt` | 5.5-SDK-multi-kas-ctl | **ctl in-place** | `KAS-config ctl restart` |
+| `nlb-case10.1.txt` | **5.5-SDK-multi-kas-tls-ctl** | **ctl in-place + TLS** | **`KAS-config TLS ctl restart`** |
+
+**Primary metric:** `Pre_readyz_reqs` in TIMING TABLE (0 = pass, >0 = OCPBUGS-86789 repro).
+
+**Compare across runs:** `T_pod_restart`, `T_route_start`, `Unhealthy_reqs`, `Late_conn_reqs`,
+VERDICT lines. Use the final report template in
+`ai-plans/lb-health-transition-e2e-plan-v23-ctl-inplace-restart.md`.
+
+**Key insight:** Pod-delete runs may show `Pre_readyz_reqs=0` while ctl runs on the same
+KAS TG config reproduce the bug — label pod-delete results as *conservative* (slow restart
+masks the pre-readyz window).
 
 ---
 
@@ -476,6 +612,8 @@ pre-readyz routing is NLB-specific or general to all AWS LBs.
 | 5.5-SDK-multi-kas | NLB | AWS SDK | DaemonSet | DS/worker, 16w | **false** | **false / 300s** | HTTP | **Most faithful KAS repro (HTTP)** |
 | 5.5-SDK-multi-kas-cip | NLB | AWS SDK | DaemonSet | DS/worker, 16w | true | **false / 300s** | HTTP | KAS TG + CIP comparison |
 | 5.5-SDK-multi-kas-tls | NLB | AWS SDK | DaemonSet | DS/worker, 16w | **false** | **false / 300s** | **TLS/HTTPS** | **KAS TLS + HC repro** |
+| 5.5-SDK-multi-kas-ctl | NLB | AWS SDK | DaemonSet | DS/worker, 16w | **false** | **false / 300s** | HTTP | **KAS + in-place restart** |
+| **5.5-SDK-multi-kas-tls-ctl** | NLB | AWS SDK | DaemonSet | DS/worker, 16w | **false** | **false / 300s** | **TLS/HTTPS** | **Most faithful KAS repro** |
 | 5.2 | NLB | Kubernetes | Deployment | 1 pod | true | default | HTTP | Shutdown propagation (SPLAT-307) |
 | 5.5-CLB | CLB | Kubernetes | Deployment | 1 pod | N/A | N/A | HTTP | Pre-readyz CLB baseline |
 
@@ -493,4 +631,7 @@ pre-readyz routing is NLB-specific or general to all AWS LBs.
 |------|-------|
 | `ai-plans/lb-health-transition-e2e-plan-v19-sdk-managed-nlb.html` | SDK NLB creation, infra discovery |
 | `ai-plans/lb-health-transition-e2e-plan-v20-daemonset-rollout.md` | Healthserver DaemonSet, same-node rollout |
-| `ai-plans/lb-health-transition-e2e-plan-v21-multi-client.md` | Four SDK variants, client scaling, preserve_client_ip matrix |
+| `ai-plans/lb-health-transition-e2e-plan-v21-multi-client.md` | SDK variant matrix (client × CIP × TG) |
+| `ai-plans/lb-health-transition-e2e-plan-v22-kas-tls-lateconn.md` | KAS TLS variant + LateConnections metric |
+| `ai-plans/lb-health-transition-e2e-plan-v23-ctl-inplace-restart.md` | ctl in-place restart engine, data collection |
+| `ai-plans/lb-health-transition-e2e-plan-v24-kas-tls-ctl.md` | KAS TLS + ctl — most faithful repro |

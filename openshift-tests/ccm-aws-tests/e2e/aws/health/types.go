@@ -22,6 +22,7 @@ type RequestRecord struct {
 	HTTPStatus      int
 	ServerState     string
 	ServerID        string
+	ServerStartTime string
 	FirstReadyzTime string
 	IsNonReadyReq   bool
 	Error           string

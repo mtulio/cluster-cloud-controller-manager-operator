@@ -328,32 +328,60 @@ func runServe(args []string) {
 	// Handle SIGTERM: set draining, readyz→503, but keep serving.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM)
-	go func() {
-		<-sigCh
+
+	signalReadyzFalse := func(fromSigterm bool) {
 		now := time.Now()
-		log.Printf("[serve] received SIGTERM, state→draining, readyz→503")
+		if fromSigterm {
+			log.Printf("[serve] received SIGTERM, state→draining, readyz→503")
+		} else {
+			log.Printf("[serve] received SIGUSR1 (ctl readyz-false), readyz→503")
+		}
 
 		mu.Lock()
-		state = "draining"
 		readyzReady = false
-		lifecycle.Sigterm = &now
 		lifecycle.ReadyzFalseAt = &now
+		if fromSigterm {
+			state = "draining"
+			lifecycle.Sigterm = &now
+		} else if state == "ready" {
+			state = "draining"
+		}
 		mu.Unlock()
 
+		if fromSigterm {
+			pushEvent(*aggregatorURL, Event{
+				Source:    "server",
+				ServerID:  serverID,
+				Event:     EventSigterm,
+				Timestamp: now,
+			})
+		}
 		pushEvent(*aggregatorURL, Event{
 			Source:    "server",
-			ServerID: serverID,
-			Event:    EventSigterm,
+			ServerID:  serverID,
+			Event:     EventReadyzFalse,
 			Timestamp: now,
 		})
-		pushEvent(*aggregatorURL, Event{
-			Source:    "server",
-			ServerID: serverID,
-			Event:    EventReadyzFalse,
-			Timestamp: now,
-		})
-		// Do NOT call srv.Shutdown() — keep serving until kubelet kills
-		// at terminationGracePeriodSeconds.
+	}
+
+	go func() {
+		<-sigCh
+		signalReadyzFalse(true)
+	}()
+
+	// SIGUSR1/SIGUSR2 from e2e-nlb-health-test ctl (kubectl exec, same pod).
+	ctlCh := make(chan os.Signal, 1)
+	signal.Notify(ctlCh, syscall.SIGUSR1, syscall.SIGUSR2)
+	go func() {
+		for sig := range ctlCh {
+			switch sig {
+			case syscall.SIGUSR1:
+				signalReadyzFalse(false)
+			case syscall.SIGUSR2:
+				log.Printf("[serve] received SIGUSR2 (ctl restart), exiting for container restart")
+				os.Exit(0)
+			}
+		}
 	}()
 
 	// Log state periodically.

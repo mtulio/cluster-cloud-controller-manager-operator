@@ -88,6 +88,7 @@ type ClientRecord struct {
 	HTTPStatus      int           `json:"http_status"`
 	ServerState     string        `json:"server_state"`
 	ServerID        string        `json:"server_id"`
+	ServerStartTime string        `json:"server_start_time"`
 	FirstReadyzTime string        `json:"first_readyz_time"`
 	IsNonReadyReq   bool          `json:"is_non_ready_req"`
 	Error           string        `json:"error,omitempty"`

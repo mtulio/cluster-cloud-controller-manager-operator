@@ -24,8 +24,9 @@ openshift-tests/ccm-aws-tests/
 │   ├── main.go                 # /readyz control, X-Server-State headers, admin API
 │   └── Dockerfile              # Multi-stage scratch build (~10MB)
 ├── e2e/aws/
-│   ├── lb_health_transition.go # Ginkgo scenarios (5.5, 5.5-CAPA, 5.2, 5.5-CLB, 5.5-SDK×4)
-│   ├── sdk_nlb.go              # SDK-managed NLB create/delete, preserve_client_ip helper
+│   ├── lb_health_transition.go # Ginkgo scenarios (5.5, 5.5-CAPA, 5.2, 5.5-CLB, 5.5-SDK×9)
+│   ├── sdk_nlb.go              # SDK-managed NLB create/delete, TG attribute helpers
+│   ├── ctl_exec.go             # kubectl exec ctl helpers (ctl-in-place restart only)
 │   └── health/
 │       ├── TEST_CASES.md       # Human-readable scenario docs + diagrams
 │       ├── types.go            # HealthEvent, RequestRecord, TargetSnapshot
@@ -63,9 +64,9 @@ SHUTDOWN PHASE (SPLAT-307):
   t7    Last client request routed to target
 
 RESTART PHASE (Scenario 5.5 only):
-  t7.1  Pod delete sent
-  t7.3  New pod TCP up (first NLB-routed response)
-  t7.4  First pre-readyz request from new pod (BUG if present)
+  t7.1  Restart trigger — pod delete (default) OR ctl restart (5.5-SDK-multi-kas-ctl)
+  t7.3  Target TCP up (from X-Server-Start-Time header)
+  t7.4  First pre-readyz request from restarted process (BUG if present)
 
 STARTUP PHASE:
   t8    /readyz → 200 (from X-First-Readyz-Time header or admin signal)
@@ -171,20 +172,35 @@ Control group for NLB-specific behaviour.
 
 ### SDK-Managed NLB Variants (KAS-equivalent)
 
-Four comparable tests using AWS SDK to provision the NLB (same stack as the
-real KAS NLB). Healthserver runs as a **DaemonSet** on control-plane nodes
-(same-node replacement on rollout). See **`TEST_CASES.md`** for diagrams and
-run filters.
+Nine comparable tests using AWS SDK to provision the NLB (same stack as the
+real KAS NLB). Healthserver runs as a **DaemonSet** on control-plane nodes.
+See **`TEST_CASES.md`** for diagrams, restart engines, and run filters.
 
-| Scenario | Client | preserve_client_ip | Purpose |
-|----------|--------|-------------------|---------|
-| 5.5-SDK | 1 pod, 32 workers | true | Baseline (single client IP → skewed traffic) |
-| 5.5-SDK-no-cip | 1 pod, 32 workers | false | Isolate stickiness with single client |
-| 5.5-SDK-multi | DaemonSet / worker | true | **Recommended** — even traffic, KAS-faithful |
-| 5.5-SDK-multi-no-cip | DaemonSet / worker | false | Multi-client control (no stickiness) |
+**KAS-faithful tier (recommended for OCPBUGS-86789 evidence):**
 
-**Plan:** `ai-plans/lb-health-transition-e2e-plan-v21-multi-client.md`  
-**Depends on:** v19 (SDK NLB), v20 (healthserver DaemonSet)
+| Scenario | TLS | Restart | Faithfulness |
+|----------|-----|---------|--------------|
+| 5.5-SDK-multi-kas | HTTP | pod delete | TG + clients (conservative restart) |
+| 5.5-SDK-multi-kas-tls | TLS | pod delete | TG + TLS (conservative restart) |
+| 5.5-SDK-multi-kas-ctl | HTTP | ctl | TG + realistic restart |
+| **5.5-SDK-multi-kas-tls-ctl** | **TLS** | **ctl** | **Full KAS path (v24)** |
+
+| Scenario | Client | preserve_client_ip | TG / TLS | Restart |
+|----------|--------|-------------------|----------|---------|
+| 5.5-SDK | 1 pod, 32w | true | default / HTTP | pod delete |
+| 5.5-SDK-no-cip | 1 pod, 32w | false | default / HTTP | pod delete |
+| 5.5-SDK-multi | DS / worker | true | default / HTTP | pod delete |
+| 5.5-SDK-multi-no-cip | DS / worker | false | default / HTTP | pod delete |
+| 5.5-SDK-multi-kas | DS / worker | false | KAS TG / HTTP | pod delete |
+| 5.5-SDK-multi-kas-cip | DS / worker | true | KAS TG / HTTP | pod delete |
+| 5.5-SDK-multi-kas-tls | DS / worker | false | KAS TG / TLS | pod delete |
+| **5.5-SDK-multi-kas-tls-ctl** | DS / worker | false | KAS TG / TLS | **ctl in-place** |
+| **5.5-SDK-multi-kas-ctl** | DS / worker | false | KAS TG / HTTP | **ctl in-place** |
+
+**Plans:** v21 (matrix), v22 (TLS), v23 (ctl restart), **v24 (TLS + ctl)**
+
+Only `5.5-SDK-multi-kas-ctl` and `5.5-SDK-multi-kas-tls-ctl` use the ctl restart engine;
+other SDK tests still use pod delete.
 
 ```sh
 # Example: recommended variant
@@ -373,5 +389,5 @@ avoid per-line logger timestamps) containing:
 - Periodic CI job in CCCMO
 
 **Done:** CLB baseline (5.5-CLB), SDK-managed NLB (v19), DaemonSet rollout (v20),
-SDK 4-variant matrix (v21)
+SDK 8-variant matrix (v21–v23), ctl in-place restart (v23)
 - Multi-region runs (us-west-2, eu-west-1)

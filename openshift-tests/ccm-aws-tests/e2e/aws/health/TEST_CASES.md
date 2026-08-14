@@ -409,7 +409,7 @@ Same TG attributes as **5.5-SDK-multi-kas**, but simulates KAS restart more fait
 | preserve_client_ip | false |
 | connection_termination | false |
 | draining_interval | 300s |
-| shutdown drain observe | 90s before ctl restart |
+| shutdown drain observe | **90s** before ctl restart (Hyperplane-boundary timing; see case 9.x) |
 
 **Run:**
 ```bash
@@ -435,7 +435,7 @@ $BIN run-test "...multi-client KAS-config ctl restart..."
 | Traffic | **TLS** on port 19443 (self-signed cert, `--tls-insecure` client) |
 | Health check | **HTTPS** `/readyz` on same port |
 | Client | DaemonSet on workers, 16 workers × 50ms per pod |
-| Restart | **ctl in-place** (SIGUSR1 shutdown → 90s drain → SIGUSR2 restart) |
+| Restart | **ctl in-place** (SIGUSR1 shutdown → **30s** drain → SIGUSR2 restart) |
 
 Same ctl flow as **5.5-SDK-multi-kas-ctl**, with TLS/HTTPS HC from **5.5-SDK-multi-kas-tls**.
 
@@ -447,11 +447,33 @@ Same ctl flow as **5.5-SDK-multi-kas-ctl**, with TLS/HTTPS HC from **5.5-SDK-mul
 | preserve_client_ip | false |
 | connection_termination | false |
 | draining_interval | 300s |
+| shutdown drain observe | **30s** before ctl restart (v25) |
+
+**Timing (v25):** After TG detects unhealthy (~25s post t5), wait **30s** drain, then
+ctl restart → TCP up ~**55s** after readyz→503. Places recovery inside the NLB
+Hyperplane propagation window (50–120s), improving repro consistency vs 90s drain
+(~117s total) which sat at the propagation boundary (cases 9.1/9.2 reproduced;
+9.3/9.4 did not — cloud variability, not code).
+
+**Also confirms:** `unhealthy.draining` (conn_term=false, draining=300s) does **not**
+prevent pre-readyz routing — case 9.1/9.2 routed 204/37 pre-readyz reqs while target
+was in draining state.
+
+**Observed results (v25, 30s drain):**
+
+| Case | Pre_readyz | T_route_stop | Result |
+|------|------------|--------------|--------|
+| 10.2 | **19,676** | **54.78s** | ✅ REPRODUCED (consistent) |
+| 10.3 | **10,784** | **52.67s** | ✅ REPRODUCED (consistent) |
+
+TCP reopens ~55s after readyz→503 while `T_route_stop` is still ~53s — NLB is actively
+routing during container restart. Contrast case 9.3/9.4 (90s drain, `T_route_stop` ~1m22s,
+TCP ~1m55s, 0 pre-readyz).
 
 **Run:**
 ```bash
 $BIN run-test "...multi-client KAS-config TLS ctl restart..." \
-  | tee ai-plans/nlb-test-cases/nlb-case10.1.txt
+  | tee ai-plans/nlb-test-cases/nlb-case10.2.txt
 ```
 
 **Compare with:**
@@ -464,7 +486,7 @@ $BIN run-test "...KAS-config TLS..." | tee ai-plans/nlb-test-cases/nlb-case7.1.t
 
 **Code:** `lb_health_transition.go`, `tls_certs.go`, `ctl_exec.go`, `cmd/e2e-nlb-health-test/ctl.go`
 
-**Plan:** `ai-plans/lb-health-transition-e2e-plan-v24-kas-tls-ctl.md`
+**Plan:** `ai-plans/lb-health-transition-e2e-plan-v24-kas-tls-ctl.md`, `ai-plans/lb-health-transition-e2e-plan-v25-kas-tls-ctl-short-drain.md`
 
 ---
 
@@ -527,7 +549,8 @@ Before filing or updating OCPBUGS-86789 evidence, collect all SDK variant runs o
 | `nlb-case6.txt` | 5.5-SDK-multi-kas-cip | pod delete | `KAS-config preserve_client_ip=true` |
 | `nlb-case7.1.txt` | 5.5-SDK-multi-kas-tls | pod delete | `KAS-config TLS` |
 | `nlb-case9.1.txt` | 5.5-SDK-multi-kas-ctl | **ctl in-place** | `KAS-config ctl restart` |
-| `nlb-case10.1.txt` | **5.5-SDK-multi-kas-tls-ctl** | **ctl in-place + TLS** | **`KAS-config TLS ctl restart`** |
+| `nlb-case10.2.txt` | **5.5-SDK-multi-kas-tls-ctl** | **ctl + TLS (30s drain)** | **`KAS-config TLS ctl restart`** | **19,676 pre-readyz** |
+| `nlb-case10.3.txt` | **5.5-SDK-multi-kas-tls-ctl** | **ctl + TLS (30s drain)** | re-run | **10,784 pre-readyz** |
 
 **Primary metric:** `Pre_readyz_reqs` in TIMING TABLE (0 = pass, >0 = OCPBUGS-86789 repro).
 

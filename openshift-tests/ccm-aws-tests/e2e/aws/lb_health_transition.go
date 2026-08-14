@@ -71,7 +71,13 @@ const (
 	// shutdownDrainObserve is how long we wait after TG detects unhealthy
 	// before triggering in-place container restart (ctl). Allows NLB to finish
 	// routing to the draining target (t7) before TCP goes down briefly.
+	// Used by 5.5-SDK-multi-kas-ctl (legacy 90s timing — Hyperplane-dependent repro).
 	shutdownDrainObserve = 90 * time.Second
+
+	// shutdownDrainObserveShort places ctl restart ~55s after readyz→503 (after
+	// ~25s HC detect wait), inside the NLB propagation window for reliable
+	// OCPBUGS-86789 reproduction. Used by 5.5-SDK-multi-kas-tls-ctl (v25).
+	shutdownDrainObserveShort = 30 * time.Second
 )
 
 // transitionTimeline captures all timing milestones from the SPLAT-307 state
@@ -2587,6 +2593,7 @@ var _ = Describe(healthTransitionTestPrefix, func() {
 					"draining_interval":        "300",
 					"tls":                      "true",
 					"hc-protocol":              "HTTPS",
+					"shutdown-drain-observe":   shutdownDrainObserveShort.String(),
 					"target-port":              fmt.Sprintf("%d", healthserverPort),
 					"traffic-port":             fmt.Sprintf("%d", healthserverPort),
 					"hc-port":                  fmt.Sprintf("%d", healthserverPort),
@@ -2650,8 +2657,8 @@ var _ = Describe(healthTransitionTestPrefix, func() {
 			By("waiting for TG to detect unhealthy target")
 			waitForTGUnhealthy(ctx, observer, 3*time.Minute)
 
-			By(fmt.Sprintf("observing shutdown drain for %s before in-place restart", shutdownDrainObserve))
-			time.Sleep(shutdownDrainObserve)
+			By(fmt.Sprintf("observing shutdown drain for %s before in-place restart", shutdownDrainObserveShort))
+			time.Sleep(shutdownDrainObserveShort)
 
 			By("restarting healthserver in-place via ctl restart (t7.1 — SIGUSR2)")
 			t71 := time.Now()

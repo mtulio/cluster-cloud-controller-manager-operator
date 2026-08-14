@@ -268,18 +268,101 @@ $BIN run-test "...multi-client preserve_client_ip=false..."
 
 ---
 
+## Scenario 5.5-SDK-multi-kas — Multi-Client, Real KAS TG Config
+
+**Report label:** `5.5-SDK-multi-kas (Multi-Client + KAS TG Config / OCPBUGS-86789)`
+
+**Ginkgo:** `SDK-managed NLB pre-readyz routing, multi-client KAS-config (OCPBUGS-86789)`
+
+Multi-client DaemonSet with TG attributes **exactly matching the real KAS NLB**.
+This is the most faithful reproduction of real OCPBUGS-86789 conditions.
+
+| Parameter | Value |
+|-----------|-------|
+| Client | DaemonSet on workers, 16 workers × 50ms per pod |
+| preserve_client_ip | **false** (matches real KAS) |
+| connection_termination | **false** (matches real KAS; default is true) |
+| draining_interval | **300s** (matches real KAS; default is 0) |
+| deregistration_delay | 300s |
+| deregistration_delay.connection_termination | false |
+| stickiness | false |
+
+**Key difference from 5.5-SDK-multi-no-cip:** The `connection_termination=false` +
+`draining_interval=300s` combination means the NLB does NOT immediately terminate
+connections to unhealthy targets. Instead, it drains them for up to 300s — the same
+window as the real KAS NLB. This produces higher `Unhealthy_reqs` counts in the
+GracefulShutdown phase, matching production behaviour.
+
+**Run:**
+```bash
+$BIN run-test "...multi-client KAS-config..."
+```
+
+**Code:** `lb_health_transition.go`, `setTGKASAttributes()` in `sdk_nlb.go`
+
+---
+
+## Scenario 5.5-SDK-multi-kas-cip — Multi-Client, KAS TG Config + CIP
+
+**Report label:** `5.5-SDK-multi-kas-cip (Multi-Client + KAS TG Config + CIP / OCPBUGS-86789)`
+
+**Ginkgo:** `SDK-managed NLB pre-readyz routing, multi-client KAS-config preserve_client_ip=true (OCPBUGS-86789)`
+
+Same as **5.5-SDK-multi-kas** but with `preserve_client_ip=true`. Allows isolating
+the source-IP stickiness effect under real KAS draining / connection-termination
+settings.
+
+| Parameter | Value |
+|-----------|-------|
+| Client | DaemonSet on workers, 16 workers × 50ms per pod |
+| preserve_client_ip | **true** (override from KAS default) |
+| connection_termination | **false** (matches real KAS) |
+| draining_interval | **300s** (matches real KAS) |
+| deregistration_delay | 300s |
+
+**Purpose:** Compare with 5.5-SDK-multi-kas to isolate `preserve_client_ip` effect
+under production-identical draining settings.
+
+**Run:**
+```bash
+$BIN run-test "...multi-client KAS-config preserve_client_ip=true..."
+```
+
+**Code:** `lb_health_transition.go`, `setTGKASAttributes()` in `sdk_nlb.go`
+
+---
+
 ## SDK Variants — Comparison Matrix
 
-All four share: healthserver DaemonSet on masters, SDK-managed NLB, same HC/TG config
-(HTTP `/readyz`, interval=10s, threshold=2), same rollout simulation (delete one pod,
-wait for same-node replacement). **Only client topology and `preserve_client_ip` differ.**
+All SDK variants share: healthserver DaemonSet on masters, SDK-managed NLB, same
+HC config (HTTP `/readyz`, interval=10s, threshold=2), same rollout simulation
+(delete one pod, wait for same-node replacement).
 
-| Scenario | Client | preserve_client_ip | Traffic spread | KAS-faithful |
-|----------|--------|-------------------|----------------|--------------|
-| 5.5-SDK | 1 pod, 32w | true | Skewed (~1 target) | NLB yes, clients no |
-| 5.5-SDK-no-cip | 1 pod, 32w | false | Even | NLB no |
-| 5.5-SDK-multi | DS/worker, 16w | true | Even | **Yes (recommended)** |
-| 5.5-SDK-multi-no-cip | DS/worker, 16w | false | Even | Clients no |
+### Default TG attributes (5.5-SDK through 5.5-SDK-multi-no-cip)
+
+| Scenario | Client | preserve_client_ip | conn_term | draining | KAS-faithful |
+|----------|--------|-------------------|-----------|----------|--------------|
+| 5.5-SDK | 1 pod, 32w | true | true (default) | 0 (default) | NLB yes, clients no |
+| 5.5-SDK-no-cip | 1 pod, 32w | false | true (default) | 0 (default) | NLB no |
+| 5.5-SDK-multi | DS/worker, 16w | true | true (default) | 0 (default) | Clients yes, TG no |
+| 5.5-SDK-multi-no-cip | DS/worker, 16w | false | true (default) | 0 (default) | Clients yes, TG no |
+
+### Real KAS TG attributes (5.5-SDK-multi-kas, 5.5-SDK-multi-kas-cip)
+
+| Scenario | Client | preserve_client_ip | conn_term | draining | KAS-faithful |
+|----------|--------|-------------------|-----------|----------|--------------|
+| 5.5-SDK-multi-kas | DS/worker, 16w | false | **false** | **300s** | **Yes (most faithful)** |
+| 5.5-SDK-multi-kas-cip | DS/worker, 16w | true | **false** | **300s** | CIP comparison |
+
+**Real KAS TG attributes** (from `aws elbv2 describe-target-group-attributes`):
+```
+preserve_client_ip.enabled                                = false
+target_health_state.unhealthy.connection_termination.enabled = false
+target_health_state.unhealthy.draining_interval_seconds     = 300
+deregistration_delay.timeout_seconds                        = 300
+deregistration_delay.connection_termination.enabled          = false
+stickiness.enabled                                          = false
+```
 
 **Shared AWS lifecycle** (all SDK variants): see v19 plan (`sdk_nlb.go`).
 Cleanup includes SG retry on `DependencyViolation` and idempotent SG create on reruns.
@@ -348,16 +431,18 @@ pre-readyz routing is NLB-specific or general to all AWS LBs.
 
 ## Summary Table
 
-| Scenario | LB Type | Managed by | Workload | Client | preserve_client_ip | Tests |
-|----------|---------|------------|----------|--------|-------------------|-------|
-| 5.5 | NLB | Kubernetes | Deployment | 1 pod | true (svc default) | Pre-readyz (OCPBUGS) |
-| 5.5-CAPA | NLB | Kubernetes | Deployment | 1 pod | true | Pre-readyz + CAPA TG |
-| 5.5-SDK | NLB | AWS SDK | DaemonSet | 1 pod, 32w | true | KAS-equivalent baseline |
-| 5.5-SDK-no-cip | NLB | AWS SDK | DaemonSet | 1 pod, 32w | **false** | Stickiness isolation |
-| 5.5-SDK-multi | NLB | AWS SDK | DaemonSet | DS/worker, 16w | true | **Recommended KAS-faithful** |
-| 5.5-SDK-multi-no-cip | NLB | AWS SDK | DaemonSet | DS/worker, 16w | **false** | Multi + no stickiness |
-| 5.2 | NLB | Kubernetes | Deployment | 1 pod | true | Shutdown propagation (SPLAT-307) |
-| 5.5-CLB | CLB | Kubernetes | Deployment | 1 pod | N/A | Pre-readyz CLB baseline |
+| Scenario | LB Type | Managed by | Workload | Client | preserve_client_ip | conn_term / draining | Tests |
+|----------|---------|------------|----------|--------|-------------------|---------------------|-------|
+| 5.5 | NLB | Kubernetes | Deployment | 1 pod | true (svc default) | default | Pre-readyz (OCPBUGS) |
+| 5.5-CAPA | NLB | Kubernetes | Deployment | 1 pod | true | default | Pre-readyz + CAPA TG |
+| 5.5-SDK | NLB | AWS SDK | DaemonSet | 1 pod, 32w | true | default | KAS-equivalent baseline |
+| 5.5-SDK-no-cip | NLB | AWS SDK | DaemonSet | 1 pod, 32w | **false** | default | Stickiness isolation |
+| 5.5-SDK-multi | NLB | AWS SDK | DaemonSet | DS/worker, 16w | true | default | Multi-client baseline |
+| 5.5-SDK-multi-no-cip | NLB | AWS SDK | DaemonSet | DS/worker, 16w | **false** | default | Multi + no stickiness |
+| 5.5-SDK-multi-kas | NLB | AWS SDK | DaemonSet | DS/worker, 16w | **false** | **false / 300s** | **Most faithful KAS repro** |
+| 5.5-SDK-multi-kas-cip | NLB | AWS SDK | DaemonSet | DS/worker, 16w | true | **false / 300s** | KAS TG + CIP comparison |
+| 5.2 | NLB | Kubernetes | Deployment | 1 pod | true | default | Shutdown propagation (SPLAT-307) |
+| 5.5-CLB | CLB | Kubernetes | Deployment | 1 pod | N/A | N/A | Pre-readyz CLB baseline |
 
 **Pass criteria (all 5.5* scenarios):**
 - `PreReadyzReqCount == 0` — no requests before `/readyz → 200`

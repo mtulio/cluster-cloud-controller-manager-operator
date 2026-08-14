@@ -604,3 +604,43 @@ func setTGPreserveClientIP(ctx context.Context, elbClient *elbv2.Client, tgARN s
 	framework.Logf("TG %s preserve_client_ip.enabled=%s set", tgARN, val)
 	return err
 }
+
+// setTGKASAttributes configures the target group to match the real KAS
+// (kube-apiserver) NLB target group attributes. The key differences from
+// AWS defaults are:
+//   - connection_termination=false: NLB does NOT immediately terminate
+//     connections to unhealthy targets (default: true).
+//   - draining_interval=300s: NLB drains unhealthy targets for up to 300s
+//     before stopping traffic (default: 0).
+//   - deregistration_delay=300s with connection_termination=false.
+//   - preserve_client_ip is configurable (KAS default: false).
+func setTGKASAttributes(ctx context.Context, elbClient *elbv2.Client, tgARN string, preserveClientIP bool) error {
+	cipVal := "false"
+	if preserveClientIP {
+		cipVal = "true"
+	}
+
+	attrs := []elbv2types.TargetGroupAttribute{
+		{Key: awssdk.String("preserve_client_ip.enabled"), Value: awssdk.String(cipVal)},
+		{Key: awssdk.String("target_health_state.unhealthy.connection_termination.enabled"), Value: awssdk.String("false")},
+		{Key: awssdk.String("target_health_state.unhealthy.draining_interval_seconds"), Value: awssdk.String("300")},
+		{Key: awssdk.String("deregistration_delay.timeout_seconds"), Value: awssdk.String("300")},
+		{Key: awssdk.String("deregistration_delay.connection_termination.enabled"), Value: awssdk.String("false")},
+		{Key: awssdk.String("stickiness.enabled"), Value: awssdk.String("false")},
+	}
+
+	framework.Logf("setting TG %s to KAS-equivalent attributes (preserve_client_ip=%s, conn_term=false, draining=300s)", tgARN, cipVal)
+	for _, a := range attrs {
+		framework.Logf("  %s=%s", *a.Key, *a.Value)
+	}
+
+	_, err := elbClient.ModifyTargetGroupAttributes(ctx, &elbv2.ModifyTargetGroupAttributesInput{
+		TargetGroupArn: awssdk.String(tgARN),
+		Attributes:     attrs,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to set KAS attributes on TG %s: %w", tgARN, err)
+	}
+	framework.Logf("TG %s KAS attributes applied", tgARN)
+	return nil
+}

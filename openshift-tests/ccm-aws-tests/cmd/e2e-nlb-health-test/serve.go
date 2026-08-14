@@ -20,7 +20,15 @@ func runServe(args []string) {
 	port := fs.Int("port", 19443, "service port")
 	startupDelay := fs.Duration("startup-delay", 30*time.Second, "time before /readyz returns 200")
 	aggregatorURL := fs.String("aggregator", "", "aggregator URL for pushing events")
+	useTLS := fs.Bool("tls", false, "serve traffic and /readyz over TLS")
+	tlsCert := fs.String("tls-cert", "", "path to TLS certificate PEM (required with --tls)")
+	tlsKey := fs.String("tls-key", "", "path to TLS private key PEM (required with --tls)")
 	fs.Parse(args)
+
+	if *useTLS && (*tlsCert == "" || *tlsKey == "") {
+		fmt.Fprintf(os.Stderr, "serve: --tls requires --tls-cert and --tls-key\n")
+		os.Exit(1)
+	}
 
 	// Server identity: POD_NAME env var, fallback to hostname.
 	serverID := os.Getenv("POD_NAME")
@@ -363,6 +371,13 @@ func runServe(args []string) {
 		}
 	}()
 
+	if *useTLS {
+		log.Printf("[serve] TLS enabled (cert=%s key=%s)", *tlsCert, *tlsKey)
+		if err := http.ListenAndServeTLS(addr, *tlsCert, *tlsKey, nil); err != nil {
+			log.Fatalf("[serve] ListenAndServeTLS failed: %v", err)
+		}
+		return
+	}
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatalf("[serve] ListenAndServe failed: %v", err)
 	}

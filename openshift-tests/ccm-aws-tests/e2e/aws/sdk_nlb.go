@@ -45,6 +45,12 @@ type ClusterInfra struct {
 	MasterSGID  string
 }
 
+// SDKNLBCreateOpts configures optional SDK NLB creation parameters.
+// Zero values use defaults matching existing HTTP-based tests.
+type SDKNLBCreateOpts struct {
+	HealthCheckProtocol elbv2types.ProtocolEnum // default HTTP
+}
+
 // discoverClusterInfra discovers VPC, subnets, master instance IDs, and master
 // security group from the running cluster. Instance IDs come from K8s node
 // spec.providerID (reliable, no EC2 tag assumptions). VPC, subnets, and SG
@@ -242,7 +248,11 @@ func removeSGIngressRule(ctx context.Context, ec2Client *ec2.Client, sgID, ruleI
 
 // createSDKManagedNLB creates an NLB, target group, and listener via the AWS
 // SDK, replicating how the OCP installer provisions the KAS NLB.
-func createSDKManagedNLB(ctx context.Context, elbClient *elbv2.Client, ec2Client *ec2.Client, infra *ClusterInfra, port int32) (*SDKManagedNLB, error) {
+func createSDKManagedNLB(ctx context.Context, elbClient *elbv2.Client, ec2Client *ec2.Client, infra *ClusterInfra, port int32, opts ...SDKNLBCreateOpts) (*SDKManagedNLB, error) {
+	hcProtocol := elbv2types.ProtocolEnumHttp
+	if len(opts) > 0 && opts[0].HealthCheckProtocol != "" {
+		hcProtocol = opts[0].HealthCheckProtocol
+	}
 	// Use the infra ID truncated to fit AWS 32-char name limit.
 	// Strip trailing dashes to satisfy AWS naming regex: (?!.*-$)^[A-Za-z0-9-]+$
 	shortID := infra.InfraID
@@ -261,7 +271,7 @@ func createSDKManagedNLB(ctx context.Context, elbClient *elbv2.Client, ec2Client
 	}
 
 	// 1. Create target group.
-	framework.Logf("creating target group %s (port %d)", resourceName, port)
+	framework.Logf("creating target group %s (port %d, hc=%s)", resourceName, port, hcProtocol)
 	tgInput := &elbv2.CreateTargetGroupInput{
 		Name:                       awssdk.String(resourceName),
 		TargetType:                 elbv2types.TargetTypeEnumInstance,
@@ -269,7 +279,7 @@ func createSDKManagedNLB(ctx context.Context, elbClient *elbv2.Client, ec2Client
 		Port:                       awssdk.Int32(port),
 		VpcId:                      awssdk.String(infra.VPCID),
 		HealthCheckEnabled:         awssdk.Bool(true),
-		HealthCheckProtocol:        elbv2types.ProtocolEnumHttp,
+		HealthCheckProtocol:        hcProtocol,
 		HealthCheckPath:            awssdk.String("/readyz"),
 		HealthCheckPort:            awssdk.String(fmt.Sprintf("%d", port)),
 		HealthCheckIntervalSeconds: awssdk.Int32(10),

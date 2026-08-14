@@ -332,6 +332,39 @@ $BIN run-test "...multi-client KAS-config preserve_client_ip=true..."
 
 ---
 
+## Scenario 5.5-SDK-multi-kas-tls — Multi-Client, KAS TG Config + TLS
+
+**Report label:** `5.5-SDK-multi-kas-tls (Multi-Client + KAS TG Config + TLS / OCPBUGS-86789)`
+
+**Ginkgo:** `SDK-managed NLB pre-readyz routing, multi-client KAS-config TLS (OCPBUGS-86789)`
+
+Clone of **5.5-SDK-multi-kas** with TLS end-to-end on the same port (`19443`):
+- healthserver serves traffic and `/readyz` via `ListenAndServeTLS`
+- NLB health check uses **HTTPS** `/readyz` on port `19443`
+- client DaemonSet uses `https://NLB:19443/` with `--tls-insecure`
+- aggregator and client metrics remain plain HTTP (unchanged)
+
+| Parameter | Value |
+|-----------|-------|
+| Client | DaemonSet on workers, 16 workers × 50ms per pod |
+| Traffic | **TLS** (self-signed cert, wildcard SAN `*`) |
+| HC protocol | **HTTPS** `/readyz` on same port |
+| preserve_client_ip | false |
+| connection_termination | false |
+| draining_interval | 300s |
+
+**Purpose:** Determine whether OCPBUGS-86789 pre-readyz routing is specific to the
+TLS handshake path (NLB may route after TCP+TLS up but before `/readyz` returns 200).
+
+**Run:**
+```bash
+$BIN run-test "...multi-client KAS-config TLS..."
+```
+
+**Code:** `lb_health_transition.go`, `tls_certs.go`, `buildHealthserverDaemonSetTLS()`, `serve.go` `--tls`
+
+---
+
 ## SDK Variants — Comparison Matrix
 
 All SDK variants share: healthserver DaemonSet on masters, SDK-managed NLB, same
@@ -347,12 +380,13 @@ HC config (HTTP `/readyz`, interval=10s, threshold=2), same rollout simulation
 | 5.5-SDK-multi | DS/worker, 16w | true | true (default) | 0 (default) | Clients yes, TG no |
 | 5.5-SDK-multi-no-cip | DS/worker, 16w | false | true (default) | 0 (default) | Clients yes, TG no |
 
-### Real KAS TG attributes (5.5-SDK-multi-kas, 5.5-SDK-multi-kas-cip)
+### Real KAS TG attributes (5.5-SDK-multi-kas, 5.5-SDK-multi-kas-cip, 5.5-SDK-multi-kas-tls)
 
-| Scenario | Client | preserve_client_ip | conn_term | draining | KAS-faithful |
-|----------|--------|-------------------|-----------|----------|--------------|
-| 5.5-SDK-multi-kas | DS/worker, 16w | false | **false** | **300s** | **Yes (most faithful)** |
-| 5.5-SDK-multi-kas-cip | DS/worker, 16w | true | **false** | **300s** | CIP comparison |
+| Scenario | Client | preserve_client_ip | conn_term | draining | TLS/HC | KAS-faithful |
+|----------|--------|-------------------|-----------|----------|--------|--------------|
+| 5.5-SDK-multi-kas | DS/worker, 16w | false | **false** | **300s** | HTTP/HTTP | **Yes (most faithful HTTP)** |
+| 5.5-SDK-multi-kas-cip | DS/worker, 16w | true | **false** | **300s** | HTTP/HTTP | CIP comparison |
+| 5.5-SDK-multi-kas-tls | DS/worker, 16w | false | **false** | **300s** | **TLS/HTTPS** | **Yes (TLS + HC)** |
 
 **Real KAS TG attributes** (from `aws elbv2 describe-target-group-attributes`):
 ```
@@ -431,18 +465,19 @@ pre-readyz routing is NLB-specific or general to all AWS LBs.
 
 ## Summary Table
 
-| Scenario | LB Type | Managed by | Workload | Client | preserve_client_ip | conn_term / draining | Tests |
-|----------|---------|------------|----------|--------|-------------------|---------------------|-------|
-| 5.5 | NLB | Kubernetes | Deployment | 1 pod | true (svc default) | default | Pre-readyz (OCPBUGS) |
-| 5.5-CAPA | NLB | Kubernetes | Deployment | 1 pod | true | default | Pre-readyz + CAPA TG |
-| 5.5-SDK | NLB | AWS SDK | DaemonSet | 1 pod, 32w | true | default | KAS-equivalent baseline |
-| 5.5-SDK-no-cip | NLB | AWS SDK | DaemonSet | 1 pod, 32w | **false** | default | Stickiness isolation |
-| 5.5-SDK-multi | NLB | AWS SDK | DaemonSet | DS/worker, 16w | true | default | Multi-client baseline |
-| 5.5-SDK-multi-no-cip | NLB | AWS SDK | DaemonSet | DS/worker, 16w | **false** | default | Multi + no stickiness |
-| 5.5-SDK-multi-kas | NLB | AWS SDK | DaemonSet | DS/worker, 16w | **false** | **false / 300s** | **Most faithful KAS repro** |
-| 5.5-SDK-multi-kas-cip | NLB | AWS SDK | DaemonSet | DS/worker, 16w | true | **false / 300s** | KAS TG + CIP comparison |
-| 5.2 | NLB | Kubernetes | Deployment | 1 pod | true | default | Shutdown propagation (SPLAT-307) |
-| 5.5-CLB | CLB | Kubernetes | Deployment | 1 pod | N/A | N/A | Pre-readyz CLB baseline |
+| Scenario | LB Type | Managed by | Workload | Client | preserve_client_ip | conn_term / draining | TLS/HC | Tests |
+|----------|---------|------------|----------|--------|-------------------|---------------------|--------|-------|
+| 5.5 | NLB | Kubernetes | Deployment | 1 pod | true (svc default) | default | HTTP | Pre-readyz (OCPBUGS) |
+| 5.5-CAPA | NLB | Kubernetes | Deployment | 1 pod | true | default | HTTP | Pre-readyz + CAPA TG |
+| 5.5-SDK | NLB | AWS SDK | DaemonSet | 1 pod, 32w | true | default | HTTP | KAS-equivalent baseline |
+| 5.5-SDK-no-cip | NLB | AWS SDK | DaemonSet | 1 pod, 32w | **false** | default | HTTP | Stickiness isolation |
+| 5.5-SDK-multi | NLB | AWS SDK | DaemonSet | DS/worker, 16w | true | default | HTTP | Multi-client baseline |
+| 5.5-SDK-multi-no-cip | NLB | AWS SDK | DaemonSet | DS/worker, 16w | **false** | default | HTTP | Multi + no stickiness |
+| 5.5-SDK-multi-kas | NLB | AWS SDK | DaemonSet | DS/worker, 16w | **false** | **false / 300s** | HTTP | **Most faithful KAS repro (HTTP)** |
+| 5.5-SDK-multi-kas-cip | NLB | AWS SDK | DaemonSet | DS/worker, 16w | true | **false / 300s** | HTTP | KAS TG + CIP comparison |
+| 5.5-SDK-multi-kas-tls | NLB | AWS SDK | DaemonSet | DS/worker, 16w | **false** | **false / 300s** | **TLS/HTTPS** | **KAS TLS + HC repro** |
+| 5.2 | NLB | Kubernetes | Deployment | 1 pod | true | default | HTTP | Shutdown propagation (SPLAT-307) |
+| 5.5-CLB | CLB | Kubernetes | Deployment | 1 pod | N/A | N/A | HTTP | Pre-readyz CLB baseline |
 
 **Pass criteria (all 5.5* scenarios):**
 - `PreReadyzReqCount == 0` — no requests before `/readyz → 200`
@@ -450,6 +485,7 @@ pre-readyz routing is NLB-specific or general to all AWS LBs.
 
 **Informational (always reported, not a failure):**
 - Shutdown propagation delay (t5→t7, ~20–35s) — expected NLB HC lag
+- `Late_conn_reqs` — requests to target after 80% of `kasShutdownDelay` (153.6s); high RST risk window
 
 ## Related Plans
 

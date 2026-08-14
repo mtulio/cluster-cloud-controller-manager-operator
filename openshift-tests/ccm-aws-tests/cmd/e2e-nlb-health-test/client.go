@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,6 +25,7 @@ func runClient(args []string) {
 	workers := fs.Int("workers", 8, "parallel request goroutines")
 	port := fs.Int("port", 8080, "port to serve metrics/records API")
 	aggregatorURL := fs.String("aggregator", "", "aggregator URL for pushing events")
+	tlsInsecure := fs.Bool("tls-insecure", false, "skip TLS certificate verification for --url")
 	fs.Parse(args)
 
 	if *url == "" {
@@ -84,11 +86,13 @@ func runClient(args []string) {
 	stopCh := make(chan struct{})
 
 	// HTTP client that creates a new TCP connection for every request.
+	transport := &http.Transport{DisableKeepAlives: true}
+	if *tlsInsecure {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // test-only self-signed cert
+	}
 	httpClient := &http.Client{
-		Transport: &http.Transport{
-			DisableKeepAlives: true,
-		},
-		Timeout: 10 * time.Second,
+		Transport: transport,
+		Timeout:   10 * time.Second,
 	}
 
 	// sendRequest performs a single GET to the NLB URL with connection tracing.

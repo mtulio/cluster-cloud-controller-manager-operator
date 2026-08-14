@@ -183,7 +183,7 @@ See **`TEST_CASES.md`** for diagrams, restart engines, and run filters.
 | 5.5-SDK-multi-kas | HTTP | pod delete | TG + clients (conservative restart) |
 | 5.5-SDK-multi-kas-tls | TLS | pod delete | TG + TLS (conservative restart) |
 | 5.5-SDK-multi-kas-ctl | HTTP | ctl | TG + realistic restart |
-| **5.5-SDK-multi-kas-tls-ctl** | **TLS** | **ctl** | **Full KAS path (v24)** |
+| **5.5-SDK-multi-kas-tls-ctl** | **TLS** | **ctl (7 drain It variants)** | **Primary evidence — use drain 30s** |
 
 | Scenario | Client | preserve_client_ip | TG / TLS | Restart |
 |----------|--------|-------------------|----------|---------|
@@ -194,7 +194,7 @@ See **`TEST_CASES.md`** for diagrams, restart engines, and run filters.
 | 5.5-SDK-multi-kas | DS / worker | false | KAS TG / HTTP | pod delete |
 | 5.5-SDK-multi-kas-cip | DS / worker | true | KAS TG / HTTP | pod delete |
 | 5.5-SDK-multi-kas-tls | DS / worker | false | KAS TG / TLS | pod delete |
-| **5.5-SDK-multi-kas-tls-ctl** | DS / worker | false | KAS TG / TLS | **ctl in-place** |
+| **5.5-SDK-multi-kas-tls-ctl** | DS / worker | false | KAS TG / TLS | **ctl (drain 15–240s variants)** |
 | **5.5-SDK-multi-kas-ctl** | DS / worker | false | KAS TG / HTTP | **ctl in-place** |
 
 **Plans:** v21 (matrix), v22 (TLS), v23 (ctl restart), **v24 (TLS + ctl)**
@@ -203,8 +203,14 @@ Only `5.5-SDK-multi-kas-ctl` and `5.5-SDK-multi-kas-tls-ctl` use the ctl restart
 other SDK tests still use pod delete.
 
 ```sh
-# Example: recommended variant
-$BIN run-test "...multi-client (OCPBUGS-86789) should not route..."
+# TLS ctl drain variant (recommended: 30s for reliable repro)
+$BIN run-test "...KAS-config TLS ctl restart... and drain 30s"
+
+# Full drain sweep (case 11): 15s 30s 60s 90s 129s 150s 240s
+# Save to nlb-cases-res/nlb-case11-plan_v25-{drain}_v1.txt
+
+# HTTP ctl (fixed 90s drain, case 9.x)
+$BIN run-test "...KAS-config ctl restart..."
 ```
 
 ## Components

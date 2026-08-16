@@ -167,7 +167,7 @@ question on the exact same stack KAS uses.
 
 | Parameter | Value |
 |-----------|-------|
-| NLB | AWS SDK, internal, `instance:port` targets |
+| NLB | AWS SDK, internal, `instance:port` targets, **cross-zone enabled** |
 | Healthserver | DaemonSet on control-plane, hostNetwork, port 19443 |
 | Client | 1 pod on worker, **32 workers** × 50ms (~640 req/s) |
 | preserve_client_ip | **true** (default, matches real KAS NLB) |
@@ -459,10 +459,11 @@ routes** to the target — i.e. `T_route_stop` ≥ time from t5 to t7.3. When TC
 **after** propagation completes, `Pre_readyz_reqs=0` even though the bug exists in production
 (real KAS always reopens during propagation).
 
-### Multi-cluster drain sweep (case 11, Aug 2025)
+### Multi-cluster drain sweep (case 11, Aug 2025 — cross-zone **off**)
 
 Three clusters, seven drain values each. Full logs: `nlb-cases-res/nlb-case11-plan_v25-*`
-(see `nlb-cases-res/nlb-tests-summary.txt` for consolidated excerpts).
+(see `nlb-cases-res/nlb-tests-summary.txt` for consolidated excerpts). **Superseded for
+evidence by case 12 / v26** (cross-zone on) — see plan v26.
 
 | Cluster | Variant suffix | Region / AZs |
 |---------|----------------|--------------|
@@ -520,8 +521,10 @@ $BIN run-test "...KAS-config TLS..."
 
 ## SDK Variants — Comparison Matrix
 
-All SDK variants share: healthserver DaemonSet on masters, SDK-managed NLB, same
-HC config (HTTP `/readyz`, interval=10s, threshold=2). They differ in **client
+All SDK variants share: healthserver DaemonSet on masters, SDK-managed NLB
+(**cross-zone load balancing enabled** on the NLB — matches real KAS internal NLB;
+TG uses `load_balancing.cross_zone.enabled=use_load_balancer_configuration`),
+same HC config (HTTP `/readyz`, interval=10s, threshold=2). They differ in **client
 topology**, **TG attributes**, **TLS**, and **restart engine** (see Restart engines
 above).
 
@@ -554,8 +557,12 @@ deregistration_delay.connection_termination.enabled          = false
 stickiness.enabled                                          = false
 ```
 
-**Shared AWS lifecycle** (all SDK variants): see v19 plan (`sdk_nlb.go`).
-Cleanup includes SG retry on `DependencyViolation` and idempotent SG create on reruns.
+**Shared AWS lifecycle** (all SDK variants): `createSDKManagedNLB()` in `sdk_nlb.go`
+enables `load_balancing.cross_zone.enabled=true` after the NLB becomes active (AWS
+default for new NLBs is off). See **`ai-plans/lb-health-transition-e2e-plan-v26-sdk-nlb-cross-zone.md`**
+— prior case 11 runs used cross-zone **off**; re-run drain sweeps as **case 12 / v26**
+before comparing `Pre_readyz_reqs`. Cleanup includes SG retry on `DependencyViolation`
+and idempotent SG create on reruns.
 
 **Plans:** v21 (SDK matrix), v22 (TLS), **v23 (ctl in-place restart)**
 
@@ -564,17 +571,45 @@ Cleanup includes SG retry on `DependencyViolation` and idempotent SG create on r
 ## SDK Data Collection — Final Report
 
 Collect SDK variant runs on the **same `HEALTHSERVER_IMAGE` build**. Save raw output under
-`nlb-cases-res/` (not committed). Consolidated excerpts: `nlb-cases-res/nlb-tests-summary.txt`.
+`nlb-cases-res/` (not committed). Aggregate with:
 
-### Case 11 — tls-ctl drain sweep (primary evidence)
+```bash
+# All results
+python3 aggregate-results.py nlb-cases-res
+
+# Single case/plan batch (drain × variant matrix for that batch only)
+python3 aggregate-results.py nlb-cases-res --prefix nlb-case12-plan26
+
+# Per-run counters (no aggregation); Run ID = log filename stem
+python3 aggregate-results.py nlb-cases-res --prefix nlb-case12-plan26 --full
+
+python3 aggregate-results.py nlb-cases-res --prefix nlb-case11-plan_v25
+```
+
+Consolidated excerpts may also be kept in `nlb-cases-res/nlb-tests-summary.txt`.
+
+### Case 11 — tls-ctl drain sweep (cross-zone **off**, pre-v26)
 
 **File pattern:** `nlb-case11-plan_v25-${DRAIN}_[${VARIANT}_]v${REV}.txt`
+
+Historical batch (Aug 2025). SDK NLB had AWS default cross-zone **disabled** — do not
+mix with case 12. Plan: v25.
 
 | Field | Values |
 |-------|--------|
 | DRAIN | `15s`, `30s`, `60s`, `90s`, `129s`, `150s`, `240s` |
 | VARIANT | (empty) = us-east-1 2 AZ; `use1` = us-east-1 all AZ; `usw1` = us-west-1 |
 | Filter | `...ctl-driven in-place container restart, and drain {DRAIN}` |
+
+### Case 12 — tls-ctl drain sweep (cross-zone **on**, v26) — **primary evidence**
+
+**File pattern:** `nlb-case12-plan_v26-${DRAIN}_[${VARIANT}_]v${REV}.txt`
+
+Re-run the case 11 matrix after v26 (`load_balancing.cross_zone.enabled=true` on SDK NLB).
+Verify in AWS console before trusting results. Plan:
+`ai-plans/lb-health-transition-e2e-plan-v26-sdk-nlb-cross-zone.md`.
+
+Same DRAIN / VARIANT / filter values as case 11.
 
 ### Earlier cases (SDK matrix)
 
@@ -589,7 +624,8 @@ Collect SDK variant runs on the **same `HEALTHSERVER_IMAGE` build**. Save raw ou
 | `nlb-case7.1.txt` | 5.5-SDK-multi-kas-tls | `KAS-config TLS` |
 | `nlb-case9.*.txt` | 5.5-SDK-multi-kas-ctl | `KAS-config ctl restart` |
 | `nlb-case10.*.txt` | 5.5-SDK-multi-kas-tls-ctl | `...and drain 30s` (early 30s runs) |
-| `nlb-case11-plan_v25-*` | 5.5-SDK-multi-kas-tls-ctl | full drain × cluster sweep |
+| `nlb-case11-plan_v25-*` | 5.5-SDK-multi-kas-tls-ctl | drain sweep, cross-zone **off** (v25) |
+| `nlb-case12-plan_v26-*` | 5.5-SDK-multi-kas-tls-ctl | drain sweep, cross-zone **on** (v26) |
 
 **Primary metric:** `Pre_readyz_reqs` (0 = pass, >0 = OCPBUGS-86789 repro).
 
@@ -597,7 +633,8 @@ Collect SDK variant runs on the **same `HEALTHSERVER_IMAGE` build**. Save raw ou
 `Unhealthy_reqs`, VERDICT lines.
 
 **Key insight:** Repro requires ctl TCP recovery **during** NLB Hyperplane propagation.
-**30s drain** on `5.5-SDK-multi-kas-tls-ctl` is the recommended default for evidence collection.
+**30s drain** on `5.5-SDK-multi-kas-tls-ctl` is the recommended default. Collect new
+evidence under **case 12 / v26** (cross-zone on); case 11 numbers are not directly comparable.
 
 ---
 

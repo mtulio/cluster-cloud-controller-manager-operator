@@ -118,6 +118,7 @@ func runServe(args []string) {
 		}
 	})
 
+	// TODO validate if it's deprecated since we change signals to ctl
 	// POST /admin/readyz?ready=true|false — control readyz state
 	http.HandleFunc("/admin/readyz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -166,6 +167,7 @@ func runServe(args []string) {
 		fmt.Fprintf(w, "readyz=%s\n", val)
 	})
 
+	// TODO validate if it's deprecated since we change signals to ctl
 	// POST /admin/shutdown?delay=Ns — graceful shutdown
 	http.HandleFunc("/admin/shutdown", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

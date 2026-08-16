@@ -405,7 +405,13 @@ func createSDKManagedNLB(ctx context.Context, elbClient *elbv2.Client, ec2Client
 		return nlb, fmt.Errorf("NLB did not become active: %w", err)
 	}
 
-	// 5. Create listener.
+	// 5. Enable cross-zone load balancing (AWS NLB default is off; real KAS internal
+	// NLB and Service-based e2e tests use cross-zone enabled).
+	if err := setNLBCrossZoneEnabled(ctx, elbClient, nlb.NLBARN, true); err != nil {
+		return nlb, fmt.Errorf("failed to enable cross-zone load balancing on NLB: %w", err)
+	}
+
+	// 6. Create listener.
 	framework.Logf("creating listener on NLB (TCP port %d -> TG %s)", port, nlb.TGARN)
 	listenerInput := &elbv2.CreateListenerInput{
 		LoadBalancerArn: awssdk.String(nlb.NLBARN),
@@ -591,6 +597,27 @@ func waitForNLBDeleted(ctx context.Context, elbClient *elbv2.Client, nlbARN stri
 		framework.Logf("NLB %s still exists, waiting for deletion...", nlbARN)
 		time.Sleep(10 * time.Second)
 	}
+}
+
+// setNLBCrossZoneEnabled sets load_balancing.cross_zone.enabled on the NLB.
+// TG attribute load_balancing.cross_zone.enabled defaults to
+// use_load_balancer_configuration, so enabling it on the NLB is sufficient.
+func setNLBCrossZoneEnabled(ctx context.Context, elbClient *elbv2.Client, nlbARN string, enabled bool) error {
+	val := "false"
+	if enabled {
+		val = "true"
+	}
+	framework.Logf("setting NLB %s load_balancing.cross_zone.enabled=%s", nlbARN, val)
+	_, err := elbClient.ModifyLoadBalancerAttributes(ctx, &elbv2.ModifyLoadBalancerAttributesInput{
+		LoadBalancerArn: awssdk.String(nlbARN),
+		Attributes: []elbv2types.LoadBalancerAttribute{
+			{Key: awssdk.String("load_balancing.cross_zone.enabled"), Value: awssdk.String(val)},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("ModifyLoadBalancerAttributes cross_zone=%s: %w", val, err)
+	}
+	return nil
 }
 
 // setTGPreserveClientIP sets the preserve_client_ip.enabled attribute on a

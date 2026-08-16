@@ -25,7 +25,7 @@ openshift-tests/ccm-aws-tests/
 │   └── Dockerfile              # Multi-stage scratch build (~10MB)
 ├── e2e/aws/
 │   ├── lb_health_transition.go # Ginkgo scenarios (5.5, 5.5-CAPA, 5.2, 5.5-CLB, 5.5-SDK×9)
-│   ├── sdk_nlb.go              # SDK-managed NLB create/delete, TG attribute helpers
+│   ├── sdk_nlb.go              # SDK-managed NLB create/delete, cross-zone, TG attrs
 │   ├── ctl_exec.go             # kubectl exec ctl helpers (ctl-in-place restart only)
 │   └── health/
 │       ├── TEST_CASES.md       # Human-readable scenario docs + diagrams
@@ -356,9 +356,13 @@ avoid per-line logger timestamps) containing:
 - **TARGET**: pod name, node, new pod (if restart)
 - **TEST PARAMETERS**: replicas, startup/shutdown delay, client interval
   and worker count
-- **SERVICE CONFIGURATION**: LB DNS/ARN, all Service annotations
-- **TARGET GROUP CONFIGURATION**: TG ARN, target type, all TG attributes
-  including health check config
+- **E2E TEST METADATA**: test intent annotations (`e2e/*` for SDK scenarios,
+  `k8s/*` for Kubernetes Service annotations) — not AWS API state
+- **LOAD BALANCER CONFIGURATION (AWS API)**: live `Describe*` snapshots at
+  report time — `DescribeLoadBalancers`, `DescribeLoadBalancerAttributes`,
+  `DescribeTargetGroups`, `DescribeTargetGroupAttributes` (includes cross-zone,
+  TG attrs, HC config). Subnet IDs and security group IDs remain under
+  `DescribeLoadBalancers`.
 - **TIMING TABLE**: all computed metrics (t0–t10) with expected values
 - **REQUEST STATISTICS**: total count, 2xx/4xx/5xx breakdown, errors
 - **REQUEST BREAKDOWN BY PHASE**: per-phase (Warmup, Shutdown, Restart,

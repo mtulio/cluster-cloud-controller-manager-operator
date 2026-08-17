@@ -546,6 +546,7 @@ above).
 | 5.5-SDK-multi-kas-tls | DS/worker, 16w | false | **false** | **300s** | **TLS/HTTPS** | pod delete |
 | 5.5-SDK-multi-kas-ctl | DS/worker, 16w | false | **false** | **300s** | HTTP/HTTP | **ctl in-place** |
 | **5.5-SDK-multi-kas-tls-ctl** | DS/worker, 16w | false | **false** | **300s** | **TLS/HTTPS** | **ctl in-place** |
+| **5.5-SDK-multi-kas-patch** (case 13) | DS/worker, 16w | false | **varies** | **varies** | **TLS/HTTPS** | **ctl in-place** |
 
 **Real KAS TG attributes** (from `aws elbv2 describe-target-group-attributes`):
 ```
@@ -564,7 +565,51 @@ default for new NLBs is off). See **`ai-plans/lb-health-transition-e2e-plan-v26-
 before comparing `Pre_readyz_reqs`. Cleanup includes SG retry on `DependencyViolation`
 and idempotent SG create on reruns.
 
-**Plans:** v21 (SDK matrix), v22 (TLS), **v23 (ctl in-place restart)**
+**Plans:** v21 (SDK matrix), v22 (TLS), **v23 (ctl in-place restart)**, v26 (cross-zone on),
+**v27 (KAS TG patch matrix — case 13)**
+
+---
+
+## Scenario 5.5-SDK-multi-kas-patch — Multi-Client, KAS-Patch TG + TLS + ctl (case 13 / v27)
+
+**Report label:** `5.5-SDK-multi-kas-tls-ctl drain {N}s (...)` with per-run TG patch in Ginkgo title
+
+**Ginkgo Context:** `SDK-managed NLB pre-readyz routing, multi-client KAS-patch TLS ctl restart (OCPBUGS-86789)`
+
+Same test body as **5.5-SDK-multi-kas-tls-ctl** (`runSDKMultiKasTLSCtlDrainTest`), but each `It`
+applies a **different KAS TG attribute patch** via `setTGKASAttributes()` before the drain/restart
+cycle. Cross-zone remains **on** (v26 SDK NLB behaviour). Goal: identify TG settings that reduce
+or eliminate `Pre_readyz_reqs` while keeping ctl restart timing realistic.
+
+### TG patch variants (filename index → plan label)
+
+| Index | Plan label | tgDesDelay | tgUnhealthyDelay | tgDesConnTerm | tgUnhealthyConnTerm | Intent |
+|-------|------------|------------|------------------|---------------|---------------------|--------|
+| `.1` | **v27.1** | 30 | 30 | false | false | Shorter unhealthy draining (30s) |
+| `.2` | **v27.2** | 90 | 90 | false | false | Medium unhealthy draining (90s) |
+| `.3` | **v27.3** | 0 | 0 | true | true | No draining; terminate on unhealthy |
+
+Shared across all patches: `lbCrossZone=true`, `tgPreserveCIP=false`, TLS traffic, HTTPS HC,
+ctl in-place restart.
+
+### Drain observe matrix (case 13)
+
+Seven post-unhealthy waits × three patches = **21 Ginkgo `It` blocks** per cluster/revision batch:
+
+| Drain observe | Ginkgo suffix |
+|---------------|---------------|
+| 30s | `...drain 30s, patch ...` |
+| 60s | `...drain 60s, patch ...` |
+| 90s | `...drain 90s, patch ...` |
+| 129s | `...drain 129s, patch ...` |
+| 150s | `...drain 150s, patch ...` |
+| 180s | `...drain 180s, patch ...` |
+| 210s | `...drain 210s, patch ...` |
+
+**Run filter** includes patch fields, e.g.:
+`...drain 90s, patch lbCrossZone=true tgDesDelay=30 tgDesConnTerm=false tgPreserveCIP=false tgUnhealthyDelay=30 tgUnhealthyConnTerm=false`
+
+**Code:** `lb_health_transition.go` (`kPatchDraining30/90/Disabled`), `setTGKASAttributes()` in `sdk_nlb.go`
 
 ---
 
@@ -580,8 +625,10 @@ python3 aggregate-results.py nlb-cases-res
 # Single case/plan batch (drain × variant matrix for that batch only)
 python3 aggregate-results.py nlb-cases-res --prefix nlb-case12-plan26
 
-# Per-run counters (no aggregation); Run ID = log filename stem
-python3 aggregate-results.py nlb-cases-res --prefix nlb-case12-plan26 --full
+# Plan 27 TG attribute validation (dotted config index in filename)
+python3 openshift-tests/ccm-aws-tests/cmd/e2e-nlb-health-test/aggregate-results.py nlb-cases-res --prefix nlb-case13-plan27
+# Matches nlb-case13-plan27.1-90s_use1_v1.txt etc.; one summary table per v27.N variant
+python3 openshift-tests/ccm-aws-tests/cmd/e2e-nlb-health-test/aggregate-results.py nlb-cases-res --prefix nlb-case13-plan27 --full
 
 python3 aggregate-results.py nlb-cases-res --prefix nlb-case11-plan_v25
 ```
@@ -611,6 +658,49 @@ Verify in AWS console before trusting results. Plan:
 
 Same DRAIN / VARIANT / filter values as case 11.
 
+### Case 13 — KAS TG patch matrix (cross-zone **on**, v27)
+
+**File pattern:** `nlb-case13-plan27.${PATCH}-${DRAIN}_${REG}_v${REV}.txt`
+
+Exercise **TG attribute patches** (not just drain timing) on top of the case 12 stack
+(TLS + HTTPS HC + ctl in-place + cross-zone on). Each patch variant is indexed in the
+filename and aggregated as plan label **v27.N**.
+
+| Field | Values |
+|-------|--------|
+| PATCH (`.N`) | `.1` = draining 30s, `.2` = draining 90s, `.3` = drain off + conn term on |
+| DRAIN | `30s`, `60s`, `90s`, `129s`, `150s`, `180s`, `210s` (observe before ctl restart) |
+| REG / VARIANT | `use1` = us-east-1; `usw1` = us-west-1 (default logs without suffix → use1) |
+| Filter | `...KAS-patch TLS ctl restart... drain {DRAIN}, patch lbCrossZone=... tgDesDelay=...` |
+
+**Batch run** (example — adjust `REG`, `REV`, and `$BIN`):
+
+```bash
+BIN=./openshift-tests/bin/cloud-controller-manager-aws-tests-ext
+REG=usw1
+CASE=case13-plan27
+for REV in $(seq 1 3); do
+  for TS in 90s 129s 150s 180s; do
+    $BIN run-test "...KAS-patch TLS ctl restart... drain ${TS}, patch lbCrossZone=true tgDesDelay=30 ..." \
+      | tee -a nlb-cases-res/nlb-${CASE}.1-${TS}_${REG}_v${REV}.txt
+    $BIN run-test "...KAS-patch TLS ctl restart... drain ${TS}, patch lbCrossZone=true tgDesDelay=90 ..." \
+      | tee -a nlb-cases-res/nlb-${CASE}.2-${TS}_${REG}_v${REV}.txt
+    $BIN run-test "...KAS-patch TLS ctl restart... drain ${TS}, patch lbCrossZone=true tgDesDelay=0 tgDesConnTerm=true ..." \
+      | tee -a nlb-cases-res/nlb-${CASE}.3-${TS}_${REG}_v${REV}.txt
+  done
+done
+```
+
+**Aggregate** (one table per v27.1 / v27.2 / v27.3):
+
+```bash
+python3 openshift-tests/ccm-aws-tests/cmd/e2e-nlb-health-test/aggregate-results.py \
+  nlb-cases-res --prefix nlb-case13-plan27
+```
+
+Do **not** cross-compare v27 patch results with case 11 (v25, cross-zone off) or case 12
+(v26, fixed KAS TG attrs) — patch and plan label differ.
+
 ### Earlier cases (SDK matrix)
 
 | Output file | Scenario | Run filter (substring) |
@@ -626,6 +716,7 @@ Same DRAIN / VARIANT / filter values as case 11.
 | `nlb-case10.*.txt` | 5.5-SDK-multi-kas-tls-ctl | `...and drain 30s` (early 30s runs) |
 | `nlb-case11-plan_v25-*` | 5.5-SDK-multi-kas-tls-ctl | drain sweep, cross-zone **off** (v25) |
 | `nlb-case12-plan_v26-*` | 5.5-SDK-multi-kas-tls-ctl | drain sweep, cross-zone **on** (v26) |
+| `nlb-case13-plan27.*-*` | 5.5-SDK-multi-kas-patch | TG patch × drain matrix (v27) |
 
 **Primary metric:** `Pre_readyz_reqs` (0 = pass, >0 = OCPBUGS-86789 repro).
 

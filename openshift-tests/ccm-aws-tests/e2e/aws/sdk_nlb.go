@@ -3,6 +3,7 @@ package aws
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -248,7 +249,7 @@ func removeSGIngressRule(ctx context.Context, ec2Client *ec2.Client, sgID, ruleI
 
 // createSDKManagedNLB creates an NLB, target group, and listener via the AWS
 // SDK, replicating how the OCP installer provisions the KAS NLB.
-func createSDKManagedNLB(ctx context.Context, elbClient *elbv2.Client, ec2Client *ec2.Client, infra *ClusterInfra, port int32, opts ...SDKNLBCreateOpts) (*SDKManagedNLB, error) {
+func createSDKManagedNLB(ctx context.Context, elbClient *elbv2.Client, ec2Client *ec2.Client, infra *ClusterInfra, port int32, kasPatch *testKASPatch, opts ...SDKNLBCreateOpts) (*SDKManagedNLB, error) {
 	hcProtocol := elbv2types.ProtocolEnumHttp
 	if len(opts) > 0 && opts[0].HealthCheckProtocol != "" {
 		hcProtocol = opts[0].HealthCheckProtocol
@@ -293,6 +294,8 @@ func createSDKManagedNLB(ctx context.Context, elbClient *elbv2.Client, ec2Client
 	}
 	nlb.TGARN = awssdk.ToString(tgResult.TargetGroups[0].TargetGroupArn)
 	framework.Logf("created target group: %s", nlb.TGARN)
+
+	// TODO move set TG attribs here, before registration
 
 	// 2. Register targets.
 	targets := make([]elbv2types.TargetDescription, 0, len(infra.InstanceIDs))
@@ -407,7 +410,7 @@ func createSDKManagedNLB(ctx context.Context, elbClient *elbv2.Client, ec2Client
 
 	// 5. Enable cross-zone load balancing (AWS NLB default is off; real KAS internal
 	// NLB and Service-based e2e tests use cross-zone enabled).
-	if err := setNLBCrossZoneEnabled(ctx, elbClient, nlb.NLBARN, true); err != nil {
+	if err := setNLBCrossZoneEnabled(ctx, elbClient, nlb.NLBARN, kasPatch.lbCrossZoneEnabled); err != nil {
 		return nlb, fmt.Errorf("failed to enable cross-zone load balancing on NLB: %w", err)
 	}
 
@@ -651,22 +654,29 @@ func setTGPreserveClientIP(ctx context.Context, elbClient *elbv2.Client, tgARN s
 //     before stopping traffic (default: 0).
 //   - deregistration_delay=300s with connection_termination=false.
 //   - preserve_client_ip is configurable (KAS default: false).
-func setTGKASAttributes(ctx context.Context, elbClient *elbv2.Client, tgARN string, preserveClientIP bool) error {
-	cipVal := "false"
-	if preserveClientIP {
-		cipVal = "true"
+func setTGKASAttributes(ctx context.Context, elbClient *elbv2.Client, tgARN string, kasPatch *testKASPatch) error {
+	if kasPatch == nil {
+		return fmt.Errorf("kasPatch is required")
 	}
+	preserveCIP := strconv.FormatBool(kasPatch.tgPreserveClientIPEnabled)
+	connTerm := strconv.FormatBool(kasPatch.tgHealthStateUnhealthyConnTermEnabled)
+	drainInterval := strconv.Itoa(kasPatch.tgHealthStateUnhealthyDrainIntervalSec)
+	deregDelay := strconv.Itoa(kasPatch.tgDesregDelayTimeoutSec)
+	deregConnTerm := strconv.FormatBool(kasPatch.tgDesregConnectTermEnabled)
 
 	attrs := []elbv2types.TargetGroupAttribute{
-		{Key: awssdk.String("preserve_client_ip.enabled"), Value: awssdk.String(cipVal)},
-		{Key: awssdk.String("target_health_state.unhealthy.connection_termination.enabled"), Value: awssdk.String("false")},
-		{Key: awssdk.String("target_health_state.unhealthy.draining_interval_seconds"), Value: awssdk.String("300")},
-		{Key: awssdk.String("deregistration_delay.timeout_seconds"), Value: awssdk.String("300")},
-		{Key: awssdk.String("deregistration_delay.connection_termination.enabled"), Value: awssdk.String("false")},
+		{Key: awssdk.String("preserve_client_ip.enabled"), Value: awssdk.String(preserveCIP)},
+		{Key: awssdk.String("target_health_state.unhealthy.connection_termination.enabled"), Value: awssdk.String(connTerm)},
+		{Key: awssdk.String("target_health_state.unhealthy.draining_interval_seconds"), Value: awssdk.String(drainInterval)},
+		{Key: awssdk.String("deregistration_delay.timeout_seconds"), Value: awssdk.String(deregDelay)},
+		{Key: awssdk.String("deregistration_delay.connection_termination.enabled"), Value: awssdk.String(deregConnTerm)},
 		{Key: awssdk.String("stickiness.enabled"), Value: awssdk.String("false")},
 	}
 
-	framework.Logf("setting TG %s to KAS-equivalent attributes (preserve_client_ip=%s, conn_term=false, draining=300s)", tgARN, cipVal)
+	framework.Logf(
+		"setting TG %s to KAS-equivalent attributes (preserve_client_ip=%s, conn_term=%s, draining=%ss, dereg_delay=%ss)",
+		tgARN, preserveCIP, connTerm, drainInterval, deregDelay,
+	)
 	for _, a := range attrs {
 		framework.Logf("  %s=%s", *a.Key, *a.Value)
 	}

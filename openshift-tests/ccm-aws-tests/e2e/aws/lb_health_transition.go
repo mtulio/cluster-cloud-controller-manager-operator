@@ -2526,6 +2526,12 @@ var _ = Describe(healthTransitionTestPrefix, func() {
 			{shutdownDrainObserve210sec, "210s", kPatchDraining30},
 			{shutdownDrainObserve210sec, "210s", kPatchDraining90},
 			{shutdownDrainObserve210sec, "210s", kPatchDrainingDisabled},
+			{shutdownDrainObserve240sec, "240s", kPatchDraining30},
+			{shutdownDrainObserve240sec, "240s", kPatchDraining90},
+			{shutdownDrainObserve240sec, "240s", kPatchDrainingDisabled},
+			{shutdownDrainObserve300sec, "300s", kPatchDraining30},
+			{shutdownDrainObserve300sec, "300s", kPatchDraining90},
+			{shutdownDrainObserve300sec, "300s", kPatchDrainingDisabled},
 		} {
 			tc := tc
 			It(fmt.Sprintf("should not route to pre-readyz targets "+
